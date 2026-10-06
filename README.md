@@ -2,13 +2,33 @@
 
 Fast, public-by-default validation of one question for Azure Virtual Desktop gold images:
 
-> Can an existing **Trusted Launch** gold image be re-captured into a **TrustedLaunchSupported**
-> Compute Gallery definition and run on an **NVMe-only** VM size (Dasv7) with Trusted Launch enabled,
-> keeping its installed applications?
+> Can an existing **Trusted Launch** gold image be re-captured into a new Compute Gallery definition
+> that allows NVMe (`DiskControllerTypes = SCSI, NVMe`) and run on an **NVMe-only** VM size (Dasv7)
+> with Trusted Launch enabled, keeping its installed applications?
 
-If yes, that re-captured image can be used as the source of an AVD **Custom Image Template**
-(Azure VM Image Builder), which rejects `SecurityType = TrustedLaunch` sources but accepts
-`TrustedLaunchSupported` ([documentation](https://learn.microsoft.com/en-us/azure/virtual-machines/image-builder-overview#confidential-vm-and-trusted-launch-support)).
+## Finding so far
+
+The first run answered a second question on the way. Capturing a Trusted Launch VM into a
+**`TrustedLaunchSupported`** definition is refused by the platform:
+
+```
+(Conflict) The source '.../virtualMachines/vm-gold-src' contains TrustedLaunch or ConfidentialVM
+security data that cannot be used in image with 'TrustedLaunchSupported' security type.
+Please use either TrustedLaunch or ConfidentialVM security type.
+```
+
+Combined with the Image Builder limitation (it accepts `TrustedLaunchSupported` sources but not
+`TrustedLaunch`, [documentation](https://learn.microsoft.com/en-us/azure/virtual-machines/image-builder-overview#confidential-vm-and-trusted-launch-support)),
+this means:
+
+| Goal | Works? | How |
+|---|---|---|
+| Move the current gold image (apps included) to Dasv7 / NVMe, and use session host update | Yes (checkpoints A, B, C) | Re-capture it into a new `TrustedLaunch` + `SCSI, NVMe` definition |
+| Use the current gold image as the source of a Custom Image Template | No | Image Builder cannot take a `TrustedLaunch` image, and the image cannot be re-captured as `TrustedLaunchSupported` |
+| Automated, repeatable builds (Custom Image Template) | Yes | Start from the Marketplace image and install applications and languages with scripts |
+
+The script also tries the snapshot route (OS disk snapshot into a `TrustedLaunchSupported` definition)
+as a non-fatal experiment, step 4b, to close that door with evidence rather than assumption.
 
 ## Run it
 
@@ -23,7 +43,7 @@ About 35 to 50 minutes. The script prints one line per checkpoint and stops on t
 
 | Checkpoint | Proves |
 |---|---|
-| A | A Trusted Launch VM can be captured into a `TrustedLaunchSupported` definition |
+| A | A Trusted Launch VM can be captured into a `TrustedLaunch` + `SCSI, NVMe` definition |
 | B | The captured version deploys on `Standard_D4as_v7` with Trusted Launch |
 | C | Inside that VM: NVMe controller, Secure Boot on, vTPM present, marker file from the source image present |
 
