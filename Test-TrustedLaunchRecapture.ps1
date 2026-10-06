@@ -64,12 +64,27 @@ Step "0. Region check: both sizes must be available (no restrictions)"
 # Keep the JMESPath simple (quotes/backticks get mangled on Windows); evaluate restrictions here
 $skus = az vm list-skus --location $Location --resource-type virtualMachines --all `
     --query "[].{name:name, restrictions:restrictions[].reasonCode}" -o json | ConvertFrom-Json
-foreach ($s in @($SourceVmSize, $TestVmSize)) {
-    $r = $skus | Where-Object name -eq $s | Select-Object -First 1
-    if (-not $r) { Fail "$s not offered in $Location" }
-    if (@($r.restrictions).Count -gt 0) { Fail "$s is restricted in $Location for this subscription ($($r.restrictions -join ','))" }
-    Pass "$s available"
+function Test-SkuAvailable([string]$size) {
+    $r = $skus | Where-Object name -eq $size | Select-Object -First 1
+    if (-not $r) { return "not offered in $Location" }
+    if (@($r.restrictions).Count -gt 0) { return "restricted for this subscription ($($r.restrictions -join ','))" }
+    return $null
 }
+# Test VM size is the whole point of the test: it must be available as requested
+$why = Test-SkuAvailable $TestVmSize
+if ($why) { Fail "$TestVmSize $why" }
+Pass "$TestVmSize available (test VM)"
+# Source VM only needs to be an x64 SCSI-capable size (simulates today's gold image); fall back if needed
+$candidates = @($SourceVmSize) + @("Standard_D4s_v5","Standard_D4ds_v5","Standard_D4ads_v5","Standard_D4as_v4","Standard_D4s_v4","Standard_D4s_v3","Standard_D2s_v5","Standard_D2s_v3","Standard_B4ms") | Select-Object -Unique
+$picked = $null
+foreach ($c in $candidates) {
+    $why = Test-SkuAvailable $c
+    if (-not $why) { $picked = $c; break }
+    Write-Host "    $c $why, trying next" -ForegroundColor DarkGray
+}
+if (-not $picked) { Fail "No SCSI-capable source VM size available in $Location. Pass -SourceVmSize with one that is." }
+if ($picked -ne $SourceVmSize) { Write-Host "    Using $picked for the source VM instead of $SourceVmSize" -ForegroundColor Yellow; $SourceVmSize = $picked }
+Pass "$SourceVmSize available (source VM)"
 
 # ---------------------------------------------------------------------------------------------
 Step "1. Resource group, gallery, image definition (Gen2, TrustedLaunchSupported, SCSI+NVMe)"
