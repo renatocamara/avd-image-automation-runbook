@@ -71,8 +71,13 @@ preparation, Sysprep, capture into the new `TrustedLaunch` + `SCSI, NVMe` defini
 $src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <current-def> --gallery-image-version <ver> --query id -o tsv
 .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <rg> -Location <region> `
     -GalleryName <gallery> -ImageDefinition <new-nvme-def> -ImageVersion 2026.1.0 `
-    -SourceImageVersionId $src -SubnetId <your subnet id>
+    -SourceImageVersionId $src -SubnetId <your subnet id> -SkipExperiment
 ```
+
+`-SkipExperiment` leaves out the `TrustedLaunchSupported` experiment definition (step 4b), which has no
+place in a real gallery. The script is safe to run in an existing resource group and gallery: it only adds
+the new definition, the new version and two temporary VMs (`vm-gold-src`, `vm-gold-test`), which must not
+exist beforehand.
 
 The marker file is still written (harmless) so checkpoint C stays identical. Add `-KeepSourceVm` if you
 want to inspect the generalized VM afterwards.
