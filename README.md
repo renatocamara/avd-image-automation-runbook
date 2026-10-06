@@ -61,15 +61,21 @@ $subnet = az network vnet subnet show -g <vnet-rg> --vnet-name <vnet> -n <subnet
 
 Nothing else changes. Pick whichever fits your environment.
 
-## Applying this to a real gold image
+## Applying this to your real gold image
 
-Replace step 3 of the script (the Marketplace VM) with a VM created from your current gold image
-version, then run the same Sysprep, capture, and test steps. In Azure CLI terms:
+Pass `-SourceImageVersionId` with the resource ID of your current gold image version. The script then
+creates the source VM from it (applications included) instead of the Marketplace image, and runs the same
+preparation, Sysprep, capture into the new `TrustedLaunch` + `SCSI, NVMe` definition, and Dasv7 test:
 
 ```powershell
 $src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <current-def> --gallery-image-version <ver> --query id -o tsv
-az vm create -g <rg> -n vm-gold-src --image $src --size Standard_D4as_v5 --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true ...
+.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <rg> -Location <region> `
+    -GalleryName <gallery> -ImageDefinition <new-nvme-def> -ImageVersion 2026.1.0 `
+    -SourceImageVersionId $src -SubnetId <your subnet id>
 ```
+
+The marker file is still written (harmless) so checkpoint C stays identical. Add `-KeepSourceVm` if you
+want to inspect the generalized VM afterwards.
 
 ## Cleanup
 
