@@ -122,17 +122,30 @@ $sec = az vm show -g $ResourceGroup -n $srcVm --query "securityProfile" -o json
 Pass "source VM created with securityProfile: $sec"
 
 Step "3a. Marker file (stands in for installed apps), NVMe driver at boot, Sysprep"
-az vm run-command invoke -g $ResourceGroup -n $srcVm --command-id RunPowerShellScript --scripts @'
+# Multi-line scripts passed inline to az get mangled on Windows; write to a file and use @file
+$prep = Join-Path $env:TEMP "avd-prep-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+@'
 New-Item -ItemType Directory -Path C:\SampleApps -Force | Out-Null
 Set-Content C:\SampleApps\marker.txt "Gold image marker $(Get-Date -Format o)"
 sc.exe config stornvme start=boot | Out-Null
 Get-AppxPackage -AllUsers | Where-Object Name -match 'OneDriveSync|LanguageExperiencePack' | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
 Start-Process -FilePath "$env:SystemRoot\System32\Sysprep\sysprep.exe" -ArgumentList '/generalize /oobe /shutdown /mode:vm'
-"sysprep started"
-'@ --query "value[0].message" -o tsv
-Write-Host "  waiting for Sysprep to shut the VM down..."
-do { Start-Sleep 30; $ps = az vm get-instance-view -g $ResourceGroup -n $srcVm --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv; Write-Host "    $ps" }
-while ($ps -ne 'PowerState/stopped')
+"sysprep started; marker=$(Test-Path C:\SampleApps\marker.txt)"
+'@ | Set-Content $prep -Encoding ascii
+$out = az vm run-command invoke -g $ResourceGroup -n $srcVm --command-id RunPowerShellScript --scripts "@$prep" --query "value[0].message" -o tsv
+Remove-Item $prep -ErrorAction SilentlyContinue
+Write-Host "    $out"
+if ($out -notmatch 'sysprep started') { Fail "prep script did not run as expected (see output above)" }
+Write-Host "  waiting for Sysprep to shut the VM down (usually 5-10 min)..."
+$deadline = (Get-Date).AddMinutes(25)
+do { Start-Sleep 30; $ps = az vm get-instance-view -g $ResourceGroup -n $srcVm --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv; Write-Host "    $(Get-Date -Format HH:mm:ss) $ps" }
+while ($ps -ne 'PowerState/stopped' -and (Get-Date) -lt $deadline)
+if ($ps -ne 'PowerState/stopped') {
+    Write-Host "  Sysprep did not finish in 25 min. Last lines of setuperr.log:" -ForegroundColor Yellow
+    az vm run-command invoke -g $ResourceGroup -n $srcVm --command-id RunPowerShellScript `
+        --scripts "Get-Content C:\Windows\System32\Sysprep\Panther\setuperr.log -ErrorAction SilentlyContinue | Select-Object -Last 20" --query "value[0].message" -o tsv
+    Fail "Sysprep did not complete (VM $srcVm left running for inspection)"
+}
 az vm deallocate -g $ResourceGroup -n $srcVm -o none
 az vm generalize -g $ResourceGroup -n $srcVm -o none
 Pass "source VM generalized"
@@ -159,7 +172,8 @@ Pass "CHECKPOINT B: test VM created, diskControllerType=$ctrl"
 
 # ---------------------------------------------------------------------------------------------
 Step "6. CHECKPOINT C: inside the test VM"
-$out = az vm run-command invoke -g $ResourceGroup -n $testVm --command-id RunPowerShellScript --scripts @'
+$chk = Join-Path $env:TEMP "avd-check-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+@'
 $r = [ordered]@{}
 $r.OS           = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion + " build " + [Environment]::OSVersion.Version.Build
 $r.Controller   = (Get-CimInstance Win32_SCSIController | Select-Object -ExpandProperty Name) -join '; '
@@ -169,7 +183,9 @@ $r.vTPM         = [bool](Get-Tpm -ErrorAction SilentlyContinue).TpmPresent
 $r.Marker       = Test-Path 'C:\SampleApps\marker.txt'
 $r.MarkerText   = if ($r.Marker) { Get-Content 'C:\SampleApps\marker.txt' } else { '' }
 $r | ConvertTo-Json -Compress
-'@ --query "value[0].message" -o tsv
+'@ | Set-Content $chk -Encoding ascii
+$out = az vm run-command invoke -g $ResourceGroup -n $testVm --command-id RunPowerShellScript --scripts "@$chk" --query "value[0].message" -o tsv
+Remove-Item $chk -ErrorAction SilentlyContinue
 $res = ($out -split "`n" | Where-Object { $_ -match '^\{' } | Select-Object -Last 1) | ConvertFrom-Json
 $res | Format-List | Out-String | Write-Host
 $ok = $true
