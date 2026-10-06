@@ -37,6 +37,8 @@
                            in the resource group (still no public IP; all access is via Run Command).
 .PARAMETER KeepSourceVm    Keep the generalized source VM after capture (default: delete it).
 .PARAMETER SkipCleanup     Keep the test VM for manual inspection.
+.PARAMETER SkipExperiment  Skip the TrustedLaunchSupported snapshot experiment (step 4b) and its extra
+                           definition. Use this when running against a real gallery.
 
 .EXAMPLE
     .\Test-TrustedLaunchRecapture.ps1 -AdminPassword (Read-Host -AsSecureString "Admin password")
@@ -45,7 +47,7 @@
 .EXAMPLE
     # Real gold image: capture your current version into the new NVMe-capable definition and test it on Dasv7
     $src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <def> --gallery-image-version <ver> --query id -o tsv
-    .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SourceImageVersionId $src -ImageVersion 2026.1.0
+    .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SourceImageVersionId $src -ImageVersion 2026.1.0 -SkipExperiment
 #>
 [CmdletBinding()]
 param(
@@ -63,7 +65,8 @@ param(
     [string]$TestVmSize     = "Standard_D4as_v7",     # NVMe-only size, the customer's target
     [string]$SubnetId       = "",                     # optional: existing subnet resource ID
     [switch]$KeepSourceVm,
-    [switch]$SkipCleanup
+    [switch]$SkipCleanup,
+    [switch]$SkipExperiment                           # do not create the TrustedLaunchSupported experiment definition (use in a real gallery)
 )
 $ErrorActionPreference = "Stop"
 $pw = [System.Net.NetworkCredential]::new("", $AdminPassword).Password
@@ -116,12 +119,14 @@ az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
     --features "SecurityType=TrustedLaunch DiskControllerTypes=SCSI,NVMe" -l $Location -o none
 $feat = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --query "features" -o json
 Pass "re-capture definition $ImageDefinition features: $feat"
-az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
-    --gallery-image-definition $ExperimentDefinition `
-    --publisher "LabAVD" --offer "Win11-AVD" --sku "goldimage-tls" `
-    --os-type Windows --os-state Generalized --hyper-v-generation V2 `
-    --features "SecurityType=TrustedLaunchSupported DiskControllerTypes=SCSI,NVMe" -l $Location -o none
-Pass "experiment definition $ExperimentDefinition (TrustedLaunchSupported) ready"
+if (-not $SkipExperiment) {
+    az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
+        --gallery-image-definition $ExperimentDefinition `
+        --publisher "LabAVD" --offer "Win11-AVD" --sku "goldimage-tls" `
+        --os-type Windows --os-state Generalized --hyper-v-generation V2 `
+        --features "SecurityType=TrustedLaunchSupported DiskControllerTypes=SCSI,NVMe" -l $Location -o none
+    Pass "experiment definition $ExperimentDefinition (TrustedLaunchSupported) ready"
+}
 
 # ---------------------------------------------------------------------------------------------
 Step "2. Network"
@@ -197,6 +202,7 @@ $state = az sig image-version show -g $ResourceGroup --gallery-name $GalleryName
 if (-not $verId -or $state -ne 'Succeeded') { Fail "capture did not produce a usable version (state=$state)" }
 Pass "CHECKPOINT A: version $ImageVersion captured from a Trusted Launch VM into $ImageDefinition (TrustedLaunch, SCSI+NVMe)"
 
+if (-not $SkipExperiment) {
 Step "4b. EXPERIMENT (non-fatal): OS disk snapshot -> TrustedLaunchSupported definition (Image Builder source?)"
 $ErrorActionPreference = "Continue"   # this block is allowed to fail
 $osDisk = az vm show -g $ResourceGroup -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
@@ -215,6 +221,7 @@ if ($expState -eq 'Succeeded') {
 }
 az snapshot delete -g $ResourceGroup -n "snap-gold-src" -o none 2>$null
 $ErrorActionPreference = "Stop"
+}
 if (-not $KeepSourceVm) { az vm delete -g $ResourceGroup -n $srcVm --yes -o none; Write-Host "  source VM deleted" }
 
 # ---------------------------------------------------------------------------------------------
