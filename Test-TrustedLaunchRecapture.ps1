@@ -1,22 +1,31 @@
 <#
 .SYNOPSIS
-    Quick validation: can a Trusted Launch gold image be re-captured into a TrustedLaunchSupported
-    gallery definition and boot on an NVMe-only size (Dasv7) with Trusted Launch enabled?
+    Quick validation: can an existing Trusted Launch gold image be re-captured into a new gallery
+    definition that allows NVMe (DiskControllerTypes=SCSI,NVMe) and boot on an NVMe-only size (Dasv7)
+    with Trusted Launch enabled, keeping its installed applications?
+
+    FINDING (first run): the platform refuses to capture a TrustedLaunch VM into a
+    TrustedLaunchSupported definition ("contains TrustedLaunch security data ... use either
+    TrustedLaunch or ConfidentialVM"). So the re-capture goes into a TrustedLaunch definition, which
+    is fine for Dasv7 and for session host update, but is NOT accepted as a Custom Image Template
+    source (Image Builder only takes TrustedLaunchSupported). Automated builds start from Marketplace.
+    Step 4b tries the snapshot route into TrustedLaunchSupported as a non-fatal experiment.
 
     No Image Builder, no private networking. Public resources, one resource group, one script.
     Expected duration: 35 to 50 minutes, most of it waiting for Sysprep and capture.
 
 .DESCRIPTION
     Steps (each prints a checkpoint line and stops on failure):
-      1. Resource group, Compute Gallery, gallery definition (Gen2, TrustedLaunchSupported, SCSI+NVMe)
+      1. Resource group, Compute Gallery, gallery definition (Gen2, TrustedLaunch, SCSI+NVMe)
       2. "Gold image" VM: Marketplace Windows 11 multi-session, Trusted Launch, SCSI size (D4as_v5),
          with a marker file standing in for the customer's installed applications
       3. NVMe readiness + Sysprep, then capture into the gallery definition      <- Checkpoint A
+      3b. Experiment: OS disk snapshot -> TrustedLaunchSupported definition      <- non-fatal
       4. Test VM from that version on Standard_D4as_v7 with Trusted Launch       <- Checkpoint B
       5. Inside the test VM: NVMe controller, Secure Boot, vTPM, marker present  <- Checkpoint C
 
     If A, B and C pass, an existing TrustedLaunch gold image can be re-captured this way and
-    (a) used as a Custom Image Template source and (b) deployed on Dasv7, with its apps intact.
+    deployed on Dasv7 with its apps intact (and used by session host update).
 
 .PARAMETER AdminPassword   Local admin password for the two VMs (12+ chars, complexity).
 .PARAMETER SubnetId        OPTIONAL. Resource ID of an existing subnet. When set, both VMs are
@@ -37,7 +46,8 @@ param(
     [string]$ResourceGroup  = "rg-avd-img-test-lab",
     [string]$Location       = "westus3",   # Dasv7 (NVMe-only) availability varies by region and subscription; step 0 checks it
     [string]$GalleryName    = "galavdtest",
-    [string]$ImageDefinition = "win11-avd-goldimage-tls",
+    [string]$ImageDefinition = "win11-avd-goldimage-tl",      # TrustedLaunch + SCSI,NVMe (re-capture target)
+    [string]$ExperimentDefinition = "win11-avd-goldimage-tls", # TrustedLaunchSupported (Image Builder source), snapshot experiment
     [string]$ImageVersion   = "1.0.0",
     [string]$SourceSku      = "win11-25h2-avd",       # Marketplace SKU standing in for the gold image
     [string]$SourceVmSize   = "Standard_D4as_v5",     # SCSI size, like the customer's current hosts
@@ -87,16 +97,22 @@ if ($picked -ne $SourceVmSize) { Write-Host "    Using $picked for the source VM
 Pass "$SourceVmSize available (source VM)"
 
 # ---------------------------------------------------------------------------------------------
-Step "1. Resource group, gallery, image definition (Gen2, TrustedLaunchSupported, SCSI+NVMe)"
+Step "1. Resource group, gallery, image definitions (Gen2, SCSI+NVMe)"
 az group create -n $ResourceGroup -l $Location -o none
 az sig create -g $ResourceGroup --gallery-name $GalleryName -l $Location -o none
 az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
     --gallery-image-definition $ImageDefinition `
+    --publisher "LabAVD" --offer "Win11-AVD" --sku "goldimage-tl" `
+    --os-type Windows --os-state Generalized --hyper-v-generation V2 `
+    --features "SecurityType=TrustedLaunch DiskControllerTypes=SCSI,NVMe" -l $Location -o none
+$feat = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --query "features" -o json
+Pass "re-capture definition $ImageDefinition features: $feat"
+az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
+    --gallery-image-definition $ExperimentDefinition `
     --publisher "LabAVD" --offer "Win11-AVD" --sku "goldimage-tls" `
     --os-type Windows --os-state Generalized --hyper-v-generation V2 `
     --features "SecurityType=TrustedLaunchSupported DiskControllerTypes=SCSI,NVMe" -l $Location -o none
-$feat = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --query "features" -o json
-Pass "definition features: $feat"
+Pass "experiment definition $ExperimentDefinition (TrustedLaunchSupported) ready"
 
 # ---------------------------------------------------------------------------------------------
 Step "2. Network"
@@ -151,14 +167,39 @@ az vm generalize -g $ResourceGroup -n $srcVm -o none
 Pass "source VM generalized"
 
 # ---------------------------------------------------------------------------------------------
-Step "4. CHECKPOINT A: capture the Trusted Launch VM into the TrustedLaunchSupported definition"
+Step "4. CHECKPOINT A: capture the Trusted Launch VM into the TrustedLaunch + SCSI,NVMe definition"
 $vmId = az vm show -g $ResourceGroup -n $srcVm --query id -o tsv
+# remove a leftover version from a previous failed run (same name)
+$ErrorActionPreference = "Continue"
+az sig image-version delete -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --gallery-image-version $ImageVersion -o none 2>$null
+$ErrorActionPreference = "Stop"
 az sig image-version create -g $ResourceGroup --gallery-name $GalleryName `
     --gallery-image-definition $ImageDefinition --gallery-image-version $ImageVersion `
     --virtual-machine $vmId --target-regions $Location -o none
+if ($LASTEXITCODE -ne 0) { Fail "capture into $ImageDefinition failed (source VM $srcVm kept for inspection)" }
 $verId = az sig image-version show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --gallery-image-version $ImageVersion --query "id" -o tsv
-if (-not $verId) { Fail "capture did not produce a version" }
-Pass "CHECKPOINT A: version $ImageVersion captured from a Trusted Launch VM into a TrustedLaunchSupported definition"
+$state = az sig image-version show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --gallery-image-version $ImageVersion --query "provisioningState" -o tsv
+if (-not $verId -or $state -ne 'Succeeded') { Fail "capture did not produce a usable version (state=$state)" }
+Pass "CHECKPOINT A: version $ImageVersion captured from a Trusted Launch VM into $ImageDefinition (TrustedLaunch, SCSI+NVMe)"
+
+Step "4b. EXPERIMENT (non-fatal): OS disk snapshot -> TrustedLaunchSupported definition (Image Builder source?)"
+$ErrorActionPreference = "Continue"   # this block is allowed to fail
+$osDisk = az vm show -g $ResourceGroup -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
+az snapshot create -g $ResourceGroup -n "snap-gold-src" --source $osDisk -l $Location -o none
+$snapId = az snapshot show -g $ResourceGroup -n "snap-gold-src" --query id -o tsv
+az sig image-version delete -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ExperimentDefinition --gallery-image-version $ImageVersion -o none 2>$null
+az sig image-version create -g $ResourceGroup --gallery-name $GalleryName `
+    --gallery-image-definition $ExperimentDefinition --gallery-image-version $ImageVersion `
+    --os-snapshot $snapId --target-regions $Location -o none 2>&1 | Tee-Object -Variable expOut | Out-Null
+$expState = az sig image-version show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ExperimentDefinition --gallery-image-version $ImageVersion --query "provisioningState" -o tsv 2>$null
+if ($expState -eq 'Succeeded') {
+    Pass "EXPERIMENT: snapshot of the TrustedLaunch OS disk WAS accepted into a TrustedLaunchSupported definition ($ExperimentDefinition/$ImageVersion). Worth testing as Custom Image Template source."
+} else {
+    Write-Host "  INFO  EXPERIMENT: snapshot route into TrustedLaunchSupported NOT accepted (expected). Automated builds must start from Marketplace." -ForegroundColor Yellow
+    if ($expOut) { Write-Host "        $($expOut | Select-Object -First 3)" -ForegroundColor DarkGray }
+}
+az snapshot delete -g $ResourceGroup -n "snap-gold-src" -o none 2>$null
+$ErrorActionPreference = "Stop"
 if (-not $KeepSourceVm) { az vm delete -g $ResourceGroup -n $srcVm --yes -o none; Write-Host "  source VM deleted" }
 
 # ---------------------------------------------------------------------------------------------
@@ -167,7 +208,9 @@ az vm create -g $ResourceGroup -n $testVm -l $Location --image $verId --size $Te
     --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
     --admin-username labadmin --admin-password $pw `
     --public-ip-address '""' --nsg-rule NONE @netArgs -o none
+if ($LASTEXITCODE -ne 0) { Fail "test VM creation on $TestVmSize failed (see error above)" }
 $ctrl = az vm show -g $ResourceGroup -n $testVm --query "storageProfile.diskControllerType" -o tsv
+if (-not $ctrl) { Fail "test VM $testVm not found after create" }
 Pass "CHECKPOINT B: test VM created, diskControllerType=$ctrl"
 
 # ---------------------------------------------------------------------------------------------
@@ -198,9 +241,10 @@ Pass "CHECKPOINT C: boots on $TestVmSize with NVMe, Secure Boot, vTPM, and the m
 # ---------------------------------------------------------------------------------------------
 $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes)
 Write-Host "`nALL CHECKPOINTS PASSED in $mins min." -ForegroundColor Green
-Write-Host "Re-capturing an existing Trusted Launch gold image into a TrustedLaunchSupported definition works,"
+Write-Host "Re-capturing an existing Trusted Launch gold image into a TrustedLaunch + SCSI,NVMe definition works,"
 Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. Applications carry over (marker present)."
-Write-Host "Captured version ID (use as Custom Image Template source):"
+Write-Host "This version can be used for session hosts / session host update, but NOT as a Custom Image Template source."
+Write-Host "Captured version ID:"
 Write-Host "  $verId"
 if ($SkipCleanup) { Write-Host "`nTest VM kept: $testVm. Delete the resource group when done: az group delete -n $ResourceGroup --yes" }
 else { az vm delete -g $ResourceGroup -n $testVm --yes -o none; Write-Host "`nTest VM deleted. Gallery and image version kept in $ResourceGroup." }
