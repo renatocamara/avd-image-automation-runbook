@@ -28,6 +28,10 @@
     deployed on Dasv7 with its apps intact (and used by session host update).
 
 .PARAMETER AdminPassword   Local admin password for the two VMs (12+ chars, complexity).
+.PARAMETER SourceImageVersionId
+                           OPTIONAL. Resource ID of your current gold image version in the Compute Gallery.
+                           When set, the source VM is created from it (applications included) instead of
+                           the Marketplace image. This is how to run the real thing, not the lab stand-in.
 .PARAMETER SubnetId        OPTIONAL. Resource ID of an existing subnet. When set, both VMs are
                            created in it with no public IP. When omitted, a temporary VNet is created
                            in the resource group (still no public IP; all access is via Run Command).
@@ -38,6 +42,10 @@
     .\Test-TrustedLaunchRecapture.ps1 -AdminPassword (Read-Host -AsSecureString "Admin password")
 .EXAMPLE
     .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SubnetId "/subscriptions/.../subnets/snet-avd"
+.EXAMPLE
+    # Real gold image: capture your current version into the new NVMe-capable definition and test it on Dasv7
+    $src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <def> --gallery-image-version <ver> --query id -o tsv
+    .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SourceImageVersionId $src -ImageVersion 2026.1.0
 #>
 [CmdletBinding()]
 param(
@@ -49,7 +57,8 @@ param(
     [string]$ImageDefinition = "win11-avd-goldimage-tl",      # TrustedLaunch + SCSI,NVMe (re-capture target)
     [string]$ExperimentDefinition = "win11-avd-goldimage-tls", # TrustedLaunchSupported (Image Builder source), snapshot experiment
     [string]$ImageVersion   = "1.0.0",
-    [string]$SourceSku      = "win11-25h2-avd",       # Marketplace SKU standing in for the gold image
+    [string]$SourceSku      = "win11-25h2-avd",       # Marketplace SKU standing in for the gold image (lab)
+    [string]$SourceImageVersionId = "",               # OPTIONAL: resource ID of your CURRENT gold image version; replaces the Marketplace VM
     [string]$SourceVmSize   = "Standard_D4as_v5",     # SCSI size, like the customer's current hosts
     [string]$TestVmSize     = "Standard_D4as_v7",     # NVMe-only size, the customer's target
     [string]$SubnetId       = "",                     # optional: existing subnet resource ID
@@ -128,9 +137,15 @@ if ($SubnetId) {
 }
 
 # ---------------------------------------------------------------------------------------------
-Step "3. Source VM: Marketplace Windows 11, TRUSTED LAUNCH, SCSI size (stands in for the gold image)"
+if ($SourceImageVersionId) {
+    Step "3. Source VM from YOUR current gold image version (applications included), TRUSTED LAUNCH, SCSI size"
+    $srcImage = $SourceImageVersionId
+} else {
+    Step "3. Source VM: Marketplace Windows 11, TRUSTED LAUNCH, SCSI size (stands in for the gold image)"
+    $srcImage = "MicrosoftWindowsDesktop:windows-11:${SourceSku}:latest"
+}
 az vm create -g $ResourceGroup -n $srcVm -l $Location `
-    --image "MicrosoftWindowsDesktop:windows-11:${SourceSku}:latest" --size $SourceVmSize `
+    --image $srcImage --size $SourceVmSize `
     --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
     --admin-username labadmin --admin-password $pw `
     --public-ip-address '""' --nsg-rule NONE @netArgs -o none
