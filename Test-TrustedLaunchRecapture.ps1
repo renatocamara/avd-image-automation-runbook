@@ -154,7 +154,7 @@ Pass "source VM created with securityProfile: $sec"
 
 Step "3a. Marker file (stands in for installed apps), NVMe driver at boot, Sysprep"
 # Multi-line scripts passed inline to az get mangled on Windows; write to a file and use @file
-$prep = Join-Path $env:TEMP "avd-prep-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+$prep = Join-Path ([IO.Path]::GetTempPath()) "avd-prep-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
 @'
 New-Item -ItemType Directory -Path C:\SampleApps -Force | Out-Null
 Set-Content C:\SampleApps\marker.txt "Gold image marker $(Get-Date -Format o)"
@@ -230,7 +230,7 @@ Pass "CHECKPOINT B: test VM created, diskControllerType=$ctrl"
 
 # ---------------------------------------------------------------------------------------------
 Step "6. CHECKPOINT C: inside the test VM"
-$chk = Join-Path $env:TEMP "avd-check-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+$chk = Join-Path ([IO.Path]::GetTempPath()) "avd-check-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
 @'
 $r = [ordered]@{}
 $r.OS           = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion + " build " + [Environment]::OSVersion.Version.Build
