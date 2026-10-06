@@ -35,7 +35,7 @@ param(
     [Parameter(Mandatory)] [securestring]$AdminPassword,
     [string]$SubscriptionId = "",
     [string]$ResourceGroup  = "rg-avd-img-test-lab",
-    [string]$Location       = "eastus2",
+    [string]$Location       = "westus3",   # Dasv7 (NVMe-only) availability varies by region and subscription; step 0 checks it
     [string]$GalleryName    = "galavdtest",
     [string]$ImageDefinition = "win11-avd-goldimage-tls",
     [string]$ImageVersion   = "1.0.0",
