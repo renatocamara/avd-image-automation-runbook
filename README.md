@@ -16,7 +16,7 @@ Requirements: PowerShell 7, Azure CLI, `az login`, Contributor on the subscripti
 
 ```powershell
 $pw = Read-Host -AsSecureString "Admin password for the lab VMs"
-.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup rg-avd-img-test-lab -Location eastus2
+.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup rg-avd-img-test-lab -Location westus3
 ```
 
 About 35 to 50 minutes. The script prints one line per checkpoint and stops on the first failure.
@@ -26,6 +26,8 @@ About 35 to 50 minutes. The script prints one line per checkpoint and stops on t
 | A | A Trusted Launch VM can be captured into a `TrustedLaunchSupported` definition |
 | B | The captured version deploys on `Standard_D4as_v7` with Trusted Launch |
 | C | Inside that VM: NVMe controller, Secure Boot on, vTPM present, marker file from the source image present |
+
+> Region note: Dasv7 sizes are not offered in every region. Step 0 of the script checks that `Standard_D4as_v5` and `Standard_D4as_v7` are available and unrestricted in the chosen region and stops before creating anything if not. In our lab subscription `Standard_D4as_v7` was only available in **West US 3**, hence the default.
 
 ## Optional: run inside an existing VNet
 
