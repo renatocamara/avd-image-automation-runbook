@@ -61,12 +61,13 @@ Write-Host "Subscription: $($sub.name) ($($sub.id))  Region: $Location  RG: $Res
 
 # ---------------------------------------------------------------------------------------------
 Step "0. Region check: both sizes must be available (no restrictions)"
-$skus = az vm list-skus --location $Location --size "Standard_D4as" --all `
-    --query "[?name=='$SourceVmSize' || name=='$TestVmSize'].{name:name, restricted:length(restrictions)>\`0\`}" -o json | ConvertFrom-Json
+# Keep the JMESPath simple (quotes/backticks get mangled on Windows); evaluate restrictions here
+$skus = az vm list-skus --location $Location --resource-type virtualMachines --all `
+    --query "[].{name:name, restrictions:restrictions[].reasonCode}" -o json | ConvertFrom-Json
 foreach ($s in @($SourceVmSize, $TestVmSize)) {
-    $r = $skus | Where-Object name -eq $s
+    $r = $skus | Where-Object name -eq $s | Select-Object -First 1
     if (-not $r) { Fail "$s not offered in $Location" }
-    if ($r.restricted) { Fail "$s is restricted in $Location for this subscription" }
+    if (@($r.restrictions).Count -gt 0) { Fail "$s is restricted in $Location for this subscription ($($r.restrictions -join ','))" }
     Pass "$s available"
 }
 
