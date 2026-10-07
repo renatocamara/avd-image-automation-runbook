@@ -135,6 +135,13 @@ If you cannot create exemptions in that subscription (shared or sandbox subscrip
 customizers on a plain VM instead with `Test-CustomizersOnVm.ps1`, which runs the same scripts in the
 same order through Run Command, then capture that VM with `Test-TrustedLaunchRecapture.ps1 -SourceVmName`.
 
+### Measured result (lab, Windows 11 25H2 multi-session, Standard_D4as_v4)
+
+`Test-CustomizersOnVm.ps1` with 7-Zip plus de-DE, fr-FR and zh-CN: ISO download 6 min, de-DE 5 min,
+fr-FR 4 min, zh-CN 5 min (fonts included), 27 min end to end including reboot and verification. All three
+languages reported by `Get-InstalledLanguage`, 21 language capabilities installed, cleanup tasks disabled.
+The previous attempt with `Install-Language` had timed out after 65 minutes on the first language.
+
 ### Why the language step uses the ISO and not `Install-Language`
 
 The first build with languages failed after 65 minutes with "The operation has timed out" inside
