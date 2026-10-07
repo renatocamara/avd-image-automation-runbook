@@ -160,10 +160,14 @@ if ($SubnetId) {
     Pass "using existing subnet: $SubnetId"
     $netArgs = @("--subnet", $SubnetId)
 } else {
+    # new VNets have no default outbound internet; a NAT gateway keeps the lab VM able to reach Windows Update etc.
     az network vnet create -g $ResourceGroup -n vnet-imgtest --address-prefix 10.200.0.0/24 `
-        --subnet-name snet-vms --subnet-prefix 10.200.0.0/26 -l $Location -o none
+        --subnet-name snet-vms --subnet-prefix 10.200.0.0/26 -l $Location --only-show-errors -o none
+    az network public-ip create -g $ResourceGroup -n pip-imgtest-nat --sku Standard --allocation-method Static -l $Location --only-show-errors -o none
+    az network nat gateway create -g $ResourceGroup -n nat-imgtest --public-ip-addresses pip-imgtest-nat --idle-timeout 10 -l $Location --only-show-errors -o none
+    az network vnet subnet update -g $ResourceGroup --vnet-name vnet-imgtest -n snet-vms --nat-gateway nat-imgtest --only-show-errors -o none
     $SubnetId = az network vnet subnet show -g $ResourceGroup --vnet-name vnet-imgtest -n snet-vms --query id -o tsv
-    Pass "temporary VNet created (delete the resource group to remove it)"
+    Pass "temporary VNet with NAT gateway created (delete the resource group to remove it)"
     $netArgs = @("--subnet", $SubnetId)
 }
 

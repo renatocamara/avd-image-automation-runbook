@@ -44,19 +44,35 @@ function Invoke-OnVm([string]$script) {
     Remove-Item $f -ErrorAction SilentlyContinue
     return $out
 }
+function Ensure-TempNetwork([string]$rg, [string]$loc) {
+    # New VNets have no default outbound internet access any more; a NAT gateway gives the lab VM a way out
+    az network vnet create -g $rg -n vnet-imgtest --address-prefix 10.200.0.0/24 --subnet-name snet-vms --subnet-prefix 10.200.0.0/26 -l $loc --only-show-errors -o none
+    az network public-ip create -g $rg -n pip-imgtest-nat --sku Standard --allocation-method Static -l $loc --only-show-errors -o none
+    az network nat gateway create -g $rg -n nat-imgtest --public-ip-addresses pip-imgtest-nat --idle-timeout 10 -l $loc --only-show-errors -o none
+    az network vnet subnet update -g $rg --vnet-name vnet-imgtest -n snet-vms --nat-gateway nat-imgtest --only-show-errors -o none
+    return (az network vnet subnet show -g $rg --vnet-name vnet-imgtest -n snet-vms --query id -o tsv)
+}
 if ($SubscriptionId) { az account set --subscription $SubscriptionId }
 
 Step "1. VM $VmName from $MarketplaceSku (Trusted Launch)"
 az group create -n $ResourceGroup -l $Location -o none
-if (-not $SubnetId) {
-    az network vnet create -g $ResourceGroup -n vnet-imgtest --address-prefix 10.200.0.0/24 --subnet-name snet-vms --subnet-prefix 10.200.0.0/26 -l $Location --only-show-errors -o none
-    $SubnetId = az network vnet subnet show -g $ResourceGroup --vnet-name vnet-imgtest -n snet-vms --query id -o tsv
+if (-not $SubnetId) { $SubnetId = Ensure-TempNetwork $ResourceGroup $Location; Write-Host "    temporary VNet with NAT gateway (outbound internet for the VM)" }
+$ErrorActionPreference = "Continue"
+$existing = az vm show -g $ResourceGroup -n $VmName --query "provisioningState" -o tsv 2>$null
+$ErrorActionPreference = "Stop"
+if ($existing) {
+    az vm start -g $ResourceGroup -n $VmName -o none
+    Pass "VM already exists, reusing it"
+} else {
+    az vm create -g $ResourceGroup -n $VmName -l $Location --image "MicrosoftWindowsDesktop:windows-11:${MarketplaceSku}:latest" --size $VmSize `
+        --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
+        --admin-username labadmin --admin-password $pw --subnet $SubnetId --public-ip-address '""' --nsg-rule NONE --only-show-errors -o none
+    if ($LASTEXITCODE -ne 0) { Fail "VM creation failed" }
+    Pass "VM created"
 }
-az vm create -g $ResourceGroup -n $VmName -l $Location --image "MicrosoftWindowsDesktop:windows-11:${MarketplaceSku}:latest" --size $VmSize `
-    --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
-    --admin-username labadmin --admin-password $pw --subnet $SubnetId --public-ip-address '""' --nsg-rule NONE --only-show-errors -o none
-if ($LASTEXITCODE -ne 0) { Fail "VM creation failed" }
-Pass "VM created"
+$net = Invoke-OnVm '"NET: " + (Test-NetConnection raw.githubusercontent.com -Port 443 -InformationLevel Quiet)'
+if (($net -join '') -notmatch 'True') { Fail "VM has no outbound internet access ($net). Attach a NAT gateway or use -SubnetId with a subnet that has outbound access." }
+Pass "outbound internet from the VM OK"
 
 Step "2. Customizers in the background on the VM (same order as the template)"
 $lines = @('$ProgressPreference = "SilentlyContinue"', 'Start-Transcript C:\Windows\Temp\customizers.log -Append | Out-Null', 'try {')
