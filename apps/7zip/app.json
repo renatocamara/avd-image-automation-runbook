@@ -1,0 +1,7 @@
+{
+  "name": "7-Zip",
+  "installer": "7z2409-x64.msi",
+  "downloadUrl": "https://www.7-zip.org/a/7z2409-x64.msi",
+  "install": "msiexec.exe /i \"{installer}\" /qn /norestart",
+  "validate": "C:\\Program Files\\7-Zip\\7z.exe"
+}

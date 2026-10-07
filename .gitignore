@@ -2,3 +2,6 @@
 *.local.ps1
 # customer-specific notes, never committed
 customer/
+generated/
+apps/*/*.msi
+apps/*/*.exe

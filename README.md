@@ -102,6 +102,38 @@ The subnet is taken from the VM's NIC unless `-SubnetId` is given.
 
 Roll the new version out with **Session host update** on a host pool created with session host configuration.
 
+## Automated build: Custom Image Template (`New-AvdImageTemplate.ps1`)
+
+The other half of the picture: a repeatable build that starts from the Marketplace Windows 11
+multi-session image, installs applications by script, adds display languages, patches once, runs
+Sysprep cleanup and publishes to the gallery. One script, public resources, no Image Builder
+extension needed in the CLI.
+
+```powershell
+.\New-AvdImageTemplate.ps1 -SubscriptionId <sub> -ResourceGroup rg-avd-img-test-lab -Location westus3
+# attach to a running build
+.\New-AvdImageTemplate.ps1 -ResourceGroup rg-avd-img-test-lab -MonitorOnly
+```
+
+What it creates: managed identity + custom role, gallery definition `win11-avd-template-tls`
+(`TrustedLaunchSupported`, `SCSI, NVMe`: the only security type Image Builder can write to; VMs made from
+it still run with Trusted Launch), a storage account with the `customizers/` scripts and `apps/` installers,
+and the template resource tagged for the AVD portal blade. Then it starts the build and follows it.
+
+Customizer order: apps (`apps/<name>/app.json`, see 7-Zip), languages, restart, Windows Update, restart,
+Sysprep cleanup. `-Languages @()` or `-Apps @()` to leave a step out. `-SubnetId` to build inside an
+existing VNet.
+
+### Why the language step uses the ISO and not `Install-Language`
+
+The first build with languages failed after 65 minutes with "The operation has timed out" inside
+`Install-Language de-DE`. On a patched image that cmdlet resolves every component through Windows
+Update, one at a time, and gives up after about an hour. `customizers/Install-Languages.ps1` instead
+downloads the Microsoft *Languages and Optional Features* ISO, mounts it, and installs the language
+pack `.cab` plus the Features on Demand with `-Source <iso> -LimitAccess`: fully offline, 10 to 15 minutes
+per language. Windows Update runs once, after the languages, and brings them to the image's patch level.
+It also disables the cleanup tasks that would otherwise remove unused language packs on the hosts.
+
 ## Cleanup
 
 ```powershell
@@ -110,5 +142,5 @@ az group delete -n rg-avd-img-test-lab --yes --no-wait
 
 ## Related
 
-`avd-image-automation-playbook` holds the full Custom Image Template pipeline (apps, languages, update cycle).
-This runbook is the quick proof that feeds it.
+`avd-image-automation-playbook` is the longer-form version of the same pipeline (docs, design decisions,
+private networking as a later step). This runbook is the short, public, one-script-per-outcome version.
