@@ -49,6 +49,7 @@ param(
     [int]$BuildTimeoutMinutes = 360,
     [string]$SubnetId        = "",                               # optional: existing subnet resource ID
     [string]$ScriptBaseUrl   = "",                               # optional: public base URL for customizers/ and apps/ (e.g. raw GitHub); skips the storage account
+    [string]$StagingResourceGroup = "",                          # optional: pre-created, EMPTY resource group for Image Builder's staging resources (lets you exempt it from policies)
     [switch]$SkipBuild,                                          # create the template only
     [switch]$MonitorOnly                                         # attach to a running build
 )
@@ -248,11 +249,23 @@ if ($SubnetId) {
     $vmProfile.vnetConfig = @{ subnetId = $SubnetId }
     Write-Host "    building inside $SubnetId"
 }
+$props = [ordered]@{}
+if ($StagingResourceGroup) {
+    # Image Builder creates a storage account in its staging RG and uses shared-key auth on it. A policy that
+    # disables shared key access or public network access on storage breaks the build ("Key based
+    # authentication is not permitted"). A fixed staging RG is the scope to exempt from that policy.
+    az group create -n $StagingResourceGroup -l $Location -o none
+    $ErrorActionPreference = "Continue"
+    az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role Contributor --scope "/subscriptions/$SubscriptionId/resourceGroups/$StagingResourceGroup" -o none 2>$null
+    $ErrorActionPreference = "Stop"
+    $props.stagingResourceGroup = "/subscriptions/$SubscriptionId/resourceGroups/$StagingResourceGroup"
+    Write-Host "    staging resource group: $StagingResourceGroup (exempt it from storage network/shared-key policies if needed)"
+}
 $template = [ordered]@{
     type = "Microsoft.VirtualMachineImages/imageTemplates"; apiVersion = $apiVersion; location = $Location
     tags = @{ AVD_IMAGE_TEMPLATE = "AVD_IMAGE_TEMPLATE" }     # makes it visible under AVD > Custom image templates
     identity = @{ type = "UserAssigned"; userAssignedIdentities = @{ $identityId = @{} } }
-    properties = [ordered]@{
+    properties = $props + [ordered]@{
         buildTimeoutInMinutes = $BuildTimeoutMinutes
         vmProfile  = $vmProfile
         source     = @{ type = "PlatformImage"; publisher = "MicrosoftWindowsDesktop"; offer = "windows-11"; sku = $MarketplaceSku; version = "latest" }
