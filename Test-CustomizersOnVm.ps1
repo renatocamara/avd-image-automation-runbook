@@ -21,7 +21,7 @@ param(
     [string]$SubscriptionId = "",
     [string]$ResourceGroup  = "rg-avd-img-test-lab",
     [string]$Location       = "westus3",
-    [string]$VmName         = "vm-customizer-test",
+    [string]$VmName         = "vm-cust-test",      # Windows computer name: max 15 chars
     [string]$VmSize         = "Standard_D4as_v4",
     [string]$MarketplaceSku = "win11-25h2-avd",
     [string[]]$Languages    = @("de-DE", "fr-FR", "zh-CN"),
