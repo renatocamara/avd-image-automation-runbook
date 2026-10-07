@@ -124,6 +124,17 @@ Customizer order: apps (`apps/<name>/app.json`, see 7-Zip), languages, restart, 
 Sysprep cleanup. `-Languages @()` or `-Apps @()` to leave a step out. `-SubnetId` to build inside an
 existing VNet.
 
+### If the build fails with "Key based authentication is not permitted on this storage account"
+
+Image Builder creates its own storage account in a staging resource group and talks to it with the
+storage key. A subscription policy that disables shared key access (or public network access) on
+storage accounts kills the build in the first minutes, before any customizer runs. Image Builder cannot
+work around it; the fix is a policy exemption on the staging resource group. Pass
+`-StagingResourceGroup <name>` so the template uses a fixed, pre-created resource group you can exempt.
+If you cannot create exemptions in that subscription (shared or sandbox subscriptions), validate the
+customizers on a plain VM instead with `Test-CustomizersOnVm.ps1`, which runs the same scripts in the
+same order through Run Command, then capture that VM with `Test-TrustedLaunchRecapture.ps1 -SourceVmName`.
+
 ### Why the language step uses the ISO and not `Install-Language`
 
 The first build with languages failed after 65 minutes with "The operation has timed out" inside
