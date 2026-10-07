@@ -49,7 +49,7 @@ param(
     [int]$BuildTimeoutMinutes = 360,
     [string]$SubnetId        = "",                               # optional: existing subnet resource ID
     [string]$ScriptBaseUrl   = "",                               # optional: public base URL for customizers/ and apps/ (e.g. raw GitHub); skips the storage account
-    [string]$StagingResourceGroup = "",                          # optional: pre-created, EMPTY resource group for Image Builder's staging resources (lets you exempt it from policies)
+    [string]$StagingResourceGroup = "",                          # optional: DEDICATED, EMPTY resource group for Image Builder's staging resources (lets you exempt it from policies)
     [switch]$SkipBuild,                                          # create the template only
     [switch]$MonitorOnly                                         # attach to a running build
 )
@@ -254,7 +254,10 @@ if ($StagingResourceGroup) {
     # Image Builder creates a storage account in its staging RG and uses shared-key auth on it. A policy that
     # disables shared key access or public network access on storage breaks the build ("Key based
     # authentication is not permitted"). A fixed staging RG is the scope to exempt from that policy.
+    if ($StagingResourceGroup -eq $ResourceGroup) { Fail "-StagingResourceGroup must be a dedicated, empty resource group (Image Builder refuses a non-empty one)" }
     az group create -n $StagingResourceGroup -l $Location -o none
+    $n = az resource list -g $StagingResourceGroup --query "length(@)" -o tsv
+    if ([int]$n -gt 0) { Fail "staging resource group $StagingResourceGroup is not empty ($n resources); Image Builder requires an empty one" }
     $ErrorActionPreference = "Continue"
     az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role Contributor --scope "/subscriptions/$SubscriptionId/resourceGroups/$StagingResourceGroup" -o none 2>$null
     $ErrorActionPreference = "Stop"

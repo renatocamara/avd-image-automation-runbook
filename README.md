@@ -130,7 +130,17 @@ Image Builder creates its own storage account in a staging resource group and ta
 storage key. A subscription policy that disables shared key access (or public network access) on
 storage accounts kills the build in the first minutes, before any customizer runs. Image Builder cannot
 work around it; the fix is a policy exemption on the staging resource group. Pass
-`-StagingResourceGroup <name>` so the template uses a fixed, pre-created resource group you can exempt.
+`-StagingResourceGroup <name>` so the template uses a fixed, dedicated and **empty** resource group you can
+exempt (Image Builder refuses a staging group that already has resources). Example exemption against an
+initiative assigned at management-group level, scoped to that resource group only:
+
+```powershell
+az group create -n rg-avd-img-staging -l <region> -o none
+az policy exemption create -n ex-imagebuilder-staging -g rg-avd-img-staging `
+  --policy-assignment "<assignment id from: az policy state list -g <rg> --filter \"PolicyDefinitionAction eq 'modify'\">" `
+  --policy-definition-reference-ids <shared-key reference id> <public-network reference id> `
+  --exemption-category Waiver --display-name "Image Builder staging storage"
+```
 If you cannot create exemptions in that subscription (shared or sandbox subscriptions), validate the
 customizers on a plain VM instead with `Test-CustomizersOnVm.ps1`, which runs the same scripts in the
 same order through Run Command, then capture that VM with `Test-TrustedLaunchRecapture.ps1 -SourceVmName`.
