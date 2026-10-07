@@ -150,8 +150,14 @@ Pass "definition $ImageDefinition features: $($feat -join ' | ')"
 
 # =============================================================================================
 Step "3. Storage account with customizers and installers"
+# public endpoint on purpose: the build VM lives in Image Builder's own network and reads the blobs with
+# the managed identity (no anonymous access). Some subscriptions default new accounts to Deny, so set it explicitly.
 az storage account create -n $StorageAccount -g $ResourceGroup -l $Location --sku Standard_LRS --kind StorageV2 `
-    --allow-blob-public-access false --min-tls-version TLS1_2 --only-show-errors -o none
+    --allow-blob-public-access false --min-tls-version TLS1_2 --public-network-access Enabled --default-action Allow `
+    --bypass AzureServices --only-show-errors -o none
+az storage account update -n $StorageAccount -g $ResourceGroup --public-network-access Enabled --default-action Allow --bypass AzureServices -o none
+$net = az storage account show -n $StorageAccount -g $ResourceGroup --query "[publicNetworkAccess, networkRuleSet.defaultAction]" -o tsv
+if (($net -join ' ') -notmatch 'Enabled\s+Allow') { Fail "storage account network rules are '$($net -join '/')'; a policy may enforce Deny. Use -SubnetId with a Storage service endpoint, or allow public access on $StorageAccount" }
 $saId = az storage account show -n $StorageAccount -g $ResourceGroup --query id -o tsv
 $ErrorActionPreference = "Continue"
 az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role "Storage Blob Data Reader" --scope $saId -o none 2>$null
