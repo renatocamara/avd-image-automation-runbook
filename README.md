@@ -82,6 +82,26 @@ exist beforehand.
 The marker file is still written (harmless) so checkpoint C stays identical. Add `-KeepSourceVm` if you
 want to inspect the generalized VM afterwards.
 
+## New gold image revision from a VM you built by hand
+
+This is the day-to-day flow once the NVMe definition exists: build the next gold image on a VM the way you
+do today (install, configure, do **not** Sysprep), then let the script do the rest:
+
+```powershell
+.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -GalleryName <gallery> `
+    -ImageDefinition <nvme-definition> -ImageVersion 2026.2.0 `
+    -SourceVmName <gold-image-vm> -SourceVmResourceGroup <vm-rg> -SkipExperiment
+```
+
+With `-SourceVmName` the script: checks the VM is running, Trusted Launch and idle (no `TiWorker`/`dism`
+still servicing), snapshots its OS disk (`-SkipSnapshot` to skip), sets `stornvme` to start at boot, removes
+the per-user packages that block Sysprep, runs Sysprep, captures the VM into the definition as the given
+version, and boots a Dasv7 test VM to confirm NVMe, Secure Boot, vTPM and the installed languages. The source
+VM is never deleted, but it is generalized by Sysprep and will not boot again; the snapshot is the way back.
+The subnet is taken from the VM's NIC unless `-SubnetId` is given.
+
+Roll the new version out with **Session host update** on a host pool created with session host configuration.
+
 ## Cleanup
 
 ```powershell

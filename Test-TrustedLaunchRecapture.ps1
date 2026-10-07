@@ -32,6 +32,14 @@
                            OPTIONAL. Resource ID of your current gold image version in the Compute Gallery.
                            When set, the source VM is created from it (applications included) instead of
                            the Marketplace image. This is how to run the real thing, not the lab stand-in.
+.PARAMETER SourceVmName    OPTIONAL. Name of an EXISTING, running Trusted Launch VM that already is your gold
+                           image (applications installed, not yet Sysprep'd). The script skips creating a
+                           source VM, snapshots its OS disk, runs the prep + Sysprep on it, captures it, and
+                           tests the result on Dasv7. The VM is never deleted. This is the "new gold image
+                           revision" flow: build the VM by hand, run this, roll out with Session host update.
+.PARAMETER SourceVmResourceGroup
+                           Resource group of -SourceVmName (default: -ResourceGroup).
+.PARAMETER SkipSnapshot    With -SourceVmName: skip the pre-Sysprep OS disk snapshot.
 .PARAMETER SubnetId        OPTIONAL. Resource ID of an existing subnet. When set, both VMs are
                            created in it with no public IP. When omitted, a temporary VNet is created
                            in the resource group (still no public IP; all access is via Run Command).
@@ -48,6 +56,11 @@
     # Real gold image: capture your current version into the new NVMe-capable definition and test it on Dasv7
     $src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <def> --gallery-image-version <ver> --query id -o tsv
     .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SourceImageVersionId $src -ImageVersion 2026.1.0 -SkipExperiment
+.EXAMPLE
+    # New gold image revision from a VM you prepared by hand (apps installed, running, not Sysprep'd)
+    .\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -GalleryName <gallery> `
+        -ImageDefinition <nvme-def> -ImageVersion 2026.2.0 `
+        -SourceVmName goldimage003 -SourceVmResourceGroup <vm-rg> -SkipExperiment
 #>
 [CmdletBinding()]
 param(
@@ -61,6 +74,9 @@ param(
     [string]$ImageVersion   = "1.0.0",
     [string]$SourceSku      = "win11-25h2-avd",       # Marketplace SKU standing in for the gold image (lab)
     [string]$SourceImageVersionId = "",               # OPTIONAL: resource ID of your CURRENT gold image version; replaces the Marketplace VM
+    [string]$SourceVmName   = "",                     # OPTIONAL: an EXISTING, running gold image VM (apps installed, not yet Sysprep'd); skips step 3
+    [string]$SourceVmResourceGroup = "",              # resource group of that VM (default: -ResourceGroup)
+    [switch]$SkipSnapshot,                            # with -SourceVmName: do not snapshot the OS disk before Sysprep
     [string]$SourceVmSize   = "Standard_D4as_v5",     # SCSI size, like the customer's current hosts
     [string]$TestVmSize     = "Standard_D4as_v7",     # NVMe-only size, the customer's target
     [string]$SubnetId       = "",                     # optional: existing subnet resource ID
@@ -70,7 +86,10 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $pw = [System.Net.NetworkCredential]::new("", $AdminPassword).Password
-$srcVm  = "vm-gold-src"
+$useExistingVm = [bool]$SourceVmName
+$srcVm  = if ($useExistingVm) { $SourceVmName } else { "vm-gold-src" }
+$srcRg  = if ($SourceVmResourceGroup) { $SourceVmResourceGroup } else { $ResourceGroup }
+if ($useExistingVm) { $KeepSourceVm = $true }   # never delete a VM we did not create
 $testVm = "vm-gold-test"
 $t0 = Get-Date
 function Step($msg) { Write-Host ("`n[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg) -ForegroundColor Cyan }
@@ -97,6 +116,7 @@ $why = Test-SkuAvailable $TestVmSize
 if ($why) { Fail "$TestVmSize $why" }
 Pass "$TestVmSize available (test VM)"
 # Source VM only needs to be an x64 SCSI-capable size (simulates today's gold image); fall back if needed
+if (-not $useExistingVm) {
 $candidates = @($SourceVmSize) + @("Standard_D4s_v5","Standard_D4ds_v5","Standard_D4ads_v5","Standard_D4as_v4","Standard_D4s_v4","Standard_D4s_v3","Standard_D2s_v5","Standard_D2s_v3","Standard_B4ms") | Select-Object -Unique
 $picked = $null
 foreach ($c in $candidates) {
@@ -107,6 +127,7 @@ foreach ($c in $candidates) {
 if (-not $picked) { Fail "No SCSI-capable source VM size available in $Location. Pass -SourceVmSize with one that is." }
 if ($picked -ne $SourceVmSize) { Write-Host "    Using $picked for the source VM instead of $SourceVmSize" -ForegroundColor Yellow; $SourceVmSize = $picked }
 Pass "$SourceVmSize available (source VM)"
+}
 
 # ---------------------------------------------------------------------------------------------
 Step "1. Resource group, gallery, image definitions (Gen2, SCSI+NVMe)"
@@ -130,6 +151,11 @@ if (-not $SkipExperiment) {
 
 # ---------------------------------------------------------------------------------------------
 Step "2. Network"
+if (-not $SubnetId -and $useExistingVm) {
+    $nicId = az vm show -g $srcRg -n $srcVm --query "networkProfile.networkInterfaces[0].id" -o tsv
+    $SubnetId = az network nic show --ids $nicId --query "ipConfigurations[0].subnet.id" -o tsv
+    Write-Host "    subnet taken from $srcVm's NIC"
+}
 if ($SubnetId) {
     Pass "using existing subnet: $SubnetId"
     $netArgs = @("--subnet", $SubnetId)
@@ -142,53 +168,71 @@ if ($SubnetId) {
 }
 
 # ---------------------------------------------------------------------------------------------
-if ($SourceImageVersionId) {
-    Step "3. Source VM from YOUR current gold image version (applications included), TRUSTED LAUNCH, SCSI size"
-    $srcImage = $SourceImageVersionId
+if ($useExistingVm) {
+    Step "3. Source VM: EXISTING gold image VM $srcRg/$srcVm (will be Sysprep'd and generalized)"
+    $ps = az vm get-instance-view -g $srcRg -n $srcVm --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv
+    if ($ps -ne 'PowerState/running') { Fail "$srcVm is $ps; it must be running (start it, finish any installs, then re-run)" }
+    $sec = az vm show -g $srcRg -n $srcVm --query "securityProfile.securityType" -o tsv
+    if ($sec -ne 'TrustedLaunch') { Fail "$srcVm securityType is '$sec'; this flow expects TrustedLaunch" }
+    # servicing still running (TiWorker/dism) is the classic cause of a broken Sysprep
+    $busy = az vm run-command invoke -g $srcRg -n $srcVm --command-id RunPowerShellScript `
+        --scripts "((Get-Process | Where-Object Name -match '^(dism|TiWorker|lpksetup|sysprep)$').Name -join ',')" --query "value[0].message" -o tsv
+    if ($busy -and $busy.Trim()) { Fail "$srcVm is still busy ($($busy.Trim())); wait for servicing to finish and re-run" }
+    Pass "$srcVm is running, Trusted Launch, idle"
+    if (-not $SkipSnapshot) {
+        $osDisk = az vm show -g $srcRg -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
+        $snapName = "snap-$srcVm-pre-sysprep-$(Get-Date -Format yyyyMMddHHmm)"
+        az snapshot create -g $srcRg -n $snapName --source $osDisk -l $Location --only-show-errors -o none
+        Pass "OS disk snapshot $snapName taken (Sysprep is one-way; this is the way back)"
+    }
 } else {
-    Step "3. Source VM: Marketplace Windows 11, TRUSTED LAUNCH, SCSI size (stands in for the gold image)"
-    $srcImage = "MicrosoftWindowsDesktop:windows-11:${SourceSku}:latest"
+    if ($SourceImageVersionId) {
+        Step "3. Source VM from YOUR current gold image version (applications included), TRUSTED LAUNCH, SCSI size"
+        $srcImage = $SourceImageVersionId
+    } else {
+        Step "3. Source VM: Marketplace Windows 11, TRUSTED LAUNCH, SCSI size (stands in for the gold image)"
+        $srcImage = "MicrosoftWindowsDesktop:windows-11:${SourceSku}:latest"
+    }
+    az vm create -g $ResourceGroup -n $srcVm -l $Location `
+        --image $srcImage --size $SourceVmSize `
+        --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
+        --admin-username labadmin --admin-password $pw `
+        --public-ip-address '""' --nsg-rule NONE @netArgs -o none
+    $sec = az vm show -g $ResourceGroup -n $srcVm --query "securityProfile" -o json
+    Pass "source VM created with securityProfile: $sec"
 }
-az vm create -g $ResourceGroup -n $srcVm -l $Location `
-    --image $srcImage --size $SourceVmSize `
-    --security-type TrustedLaunch --enable-secure-boot true --enable-vtpm true `
-    --admin-username labadmin --admin-password $pw `
-    --public-ip-address '""' --nsg-rule NONE @netArgs -o none
-$sec = az vm show -g $ResourceGroup -n $srcVm --query "securityProfile" -o json
-Pass "source VM created with securityProfile: $sec"
 
-Step "3a. Marker file (stands in for installed apps), NVMe driver at boot, Sysprep"
+Step "3a. NVMe driver at boot, Sysprep blockers removed, Sysprep (plus a marker file on lab VMs)"
 # Multi-line scripts passed inline to az get mangled on Windows; write to a file and use @file
 $prep = Join-Path ([IO.Path]::GetTempPath()) "avd-prep-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
-@'
-New-Item -ItemType Directory -Path C:\SampleApps -Force | Out-Null
-Set-Content C:\SampleApps\marker.txt "Gold image marker $(Get-Date -Format o)"
+$marker = if ($useExistingVm) { "" } else { 'New-Item -ItemType Directory -Path C:\SampleApps -Force | Out-Null; Set-Content C:\SampleApps\marker.txt "Gold image marker $(Get-Date -Format o)"' }
+$marker + "`n" + @'
 sc.exe config stornvme start=boot | Out-Null
 Get-AppxPackage -AllUsers | Where-Object Name -match 'OneDriveSync|LanguageExperiencePack' | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue }
 Start-Process -FilePath "$env:SystemRoot\System32\Sysprep\sysprep.exe" -ArgumentList '/generalize /oobe /shutdown /mode:vm'
 "sysprep started; marker=$(Test-Path C:\SampleApps\marker.txt)"
 '@ | Set-Content $prep -Encoding ascii
-$out = az vm run-command invoke -g $ResourceGroup -n $srcVm --command-id RunPowerShellScript --scripts "@$prep" --query "value[0].message" -o tsv
+$out = az vm run-command invoke -g $srcRg -n $srcVm --command-id RunPowerShellScript --scripts "@$prep" --query "value[0].message" -o tsv
 Remove-Item $prep -ErrorAction SilentlyContinue
 Write-Host "    $out"
 if ($out -notmatch 'sysprep started') { Fail "prep script did not run as expected (see output above)" }
 Write-Host "  waiting for Sysprep to shut the VM down (usually 5-10 min)..."
 $deadline = (Get-Date).AddMinutes(25)
-do { Start-Sleep 30; $ps = az vm get-instance-view -g $ResourceGroup -n $srcVm --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv; Write-Host "    $(Get-Date -Format HH:mm:ss) $ps" }
+do { Start-Sleep 30; $ps = az vm get-instance-view -g $srcRg -n $srcVm --query "instanceView.statuses[?starts_with(code,'PowerState')].code | [0]" -o tsv; Write-Host "    $(Get-Date -Format HH:mm:ss) $ps" }
 while ($ps -ne 'PowerState/stopped' -and (Get-Date) -lt $deadline)
 if ($ps -ne 'PowerState/stopped') {
     Write-Host "  Sysprep did not finish in 25 min. Last lines of setuperr.log:" -ForegroundColor Yellow
-    az vm run-command invoke -g $ResourceGroup -n $srcVm --command-id RunPowerShellScript `
+    az vm run-command invoke -g $srcRg -n $srcVm --command-id RunPowerShellScript `
         --scripts "Get-Content C:\Windows\System32\Sysprep\Panther\setuperr.log -ErrorAction SilentlyContinue | Select-Object -Last 20" --query "value[0].message" -o tsv
     Fail "Sysprep did not complete (VM $srcVm left running for inspection)"
 }
-az vm deallocate -g $ResourceGroup -n $srcVm -o none
-az vm generalize -g $ResourceGroup -n $srcVm -o none
+az vm deallocate -g $srcRg -n $srcVm -o none
+az vm generalize -g $srcRg -n $srcVm -o none
 Pass "source VM generalized"
 
 # ---------------------------------------------------------------------------------------------
 Step "4. CHECKPOINT A: capture the Trusted Launch VM into the TrustedLaunch + SCSI,NVMe definition"
-$vmId = az vm show -g $ResourceGroup -n $srcVm --query id -o tsv
+$vmId = az vm show -g $srcRg -n $srcVm --query id -o tsv
 # remove a leftover version from a previous failed run (same name)
 $ErrorActionPreference = "Continue"
 az sig image-version delete -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --gallery-image-version $ImageVersion -o none 2>$null
@@ -205,7 +249,7 @@ Pass "CHECKPOINT A: version $ImageVersion captured from a Trusted Launch VM into
 if (-not $SkipExperiment) {
 Step "4b. EXPERIMENT (non-fatal): OS disk snapshot -> TrustedLaunchSupported definition (Image Builder source?)"
 $ErrorActionPreference = "Continue"   # this block is allowed to fail
-$osDisk = az vm show -g $ResourceGroup -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
+$osDisk = az vm show -g $srcRg -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
 az snapshot create -g $ResourceGroup -n "snap-gold-src" --source $osDisk -l $Location -o none
 $snapId = az snapshot show -g $ResourceGroup -n "snap-gold-src" --query id -o tsv
 az sig image-version delete -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ExperimentDefinition --gallery-image-version $ImageVersion -o none 2>$null
@@ -222,7 +266,7 @@ if ($expState -eq 'Succeeded') {
 az snapshot delete -g $ResourceGroup -n "snap-gold-src" -o none 2>$null
 $ErrorActionPreference = "Stop"
 }
-if (-not $KeepSourceVm) { az vm delete -g $ResourceGroup -n $srcVm --yes -o none; Write-Host "  source VM deleted" }
+if (-not $KeepSourceVm) { az vm delete -g $srcRg -n $srcVm --yes -o none; Write-Host "  source VM deleted" }
 
 # ---------------------------------------------------------------------------------------------
 Step "5. CHECKPOINT B: test VM on $TestVmSize (NVMe-only) with Trusted Launch, from the captured version"
@@ -247,6 +291,7 @@ $r.SecureBoot   = try { Confirm-SecureBootUEFI } catch { $false }
 $r.vTPM         = [bool](Get-Tpm -ErrorAction SilentlyContinue).TpmPresent
 $r.Marker       = Test-Path 'C:\SampleApps\marker.txt'
 $r.MarkerText   = if ($r.Marker) { Get-Content 'C:\SampleApps\marker.txt' } else { '' }
+$r.Languages    = try { (Get-InstalledLanguage).LanguageId -join ', ' } catch { '' }
 $r | ConvertTo-Json -Compress
 '@ | Set-Content $chk -Encoding ascii
 $out = az vm run-command invoke -g $ResourceGroup -n $testVm --command-id RunPowerShellScript --scripts "@$chk" --query "value[0].message" -o tsv
@@ -254,17 +299,18 @@ Remove-Item $chk -ErrorAction SilentlyContinue
 $res = ($out -split "`n" | Where-Object { $_ -match '^\{' } | Select-Object -Last 1) | ConvertFrom-Json
 $res | Format-List | Out-String | Write-Host
 $ok = $true
-foreach ($check in @('NVMe','SecureBoot','vTPM','Marker')) {
+$checks = @('NVMe','SecureBoot','vTPM'); if (-not $useExistingVm) { $checks += 'Marker' }
+foreach ($check in $checks) {
     if ($res.$check) { Pass $check } else { Write-Host "  FAIL  $check" -ForegroundColor Red; $ok = $false }
 }
 if (-not $ok) { Fail "CHECKPOINT C failed, see values above" }
-Pass "CHECKPOINT C: boots on $TestVmSize with NVMe, Secure Boot, vTPM, and the marker from the source image"
+Pass "CHECKPOINT C: boots on $TestVmSize with NVMe, Secure Boot, vTPM$(if ($useExistingVm) { ' (languages: ' + $res.Languages + ')' } else { ', and the marker from the source image' })"
 
 # ---------------------------------------------------------------------------------------------
 $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes)
 Write-Host "`nALL CHECKPOINTS PASSED in $mins min." -ForegroundColor Green
 Write-Host "Re-capturing an existing Trusted Launch gold image into a TrustedLaunch + SCSI,NVMe definition works,"
-Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. Applications carry over (marker present)."
+Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. $(if ($useExistingVm) { 'Source VM ' + $srcVm + ' is now generalized (not bootable); the pre-Sysprep snapshot is the way back.' } else { 'Applications carry over (marker present).' })"
 Write-Host "This version can be used for session hosts / session host update, but NOT as a Custom Image Template source."
 Write-Host "Captured version ID:"
 Write-Host "  $verId"
