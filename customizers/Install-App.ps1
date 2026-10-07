@@ -15,28 +15,36 @@
     }
 #>
 param(
-    [Parameter(Mandatory)] [string]$StorageAccount,
-    [Parameter(Mandatory)] [string]$Container,
-    [Parameter(Mandatory)] [string]$AppName
+    [string]$StorageAccount = "",
+    [string]$Container = "",
+    [Parameter(Mandatory)] [string]$AppName,
+    [string]$ManifestUrl = ""      # lab mode: public URL of app.json; installer comes from its downloadUrl
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $log = "C:\Windows\Temp\imagebuild-$AppName.log"
 Start-Transcript -Path $log -Append | Out-Null
 
-# 1. Get a storage token from the build VM's managed identity (IMDS)
-$token = (Invoke-RestMethod -Headers @{ Metadata = 'true' } -Uri `
-    'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/').access_token
-$headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2021-08-06' }
-$base = "https://$StorageAccount.blob.core.windows.net/$Container/apps/$AppName"
 $work = "C:\Windows\Temp\apps\$AppName"
 New-Item -ItemType Directory -Path $work -Force | Out-Null
-
-# 2. Read the manifest and download the installer
-$manifest = Invoke-RestMethod -Uri "$base/app.json" -Headers $headers
-$installerPath = Join-Path $work $manifest.installer
-Write-Host "Downloading $($manifest.installer) ..."
-Invoke-WebRequest -Uri "$base/$($manifest.installer)" -Headers $headers -OutFile $installerPath -UseBasicParsing
+if ($ManifestUrl) {
+    # 1-2 (lab mode). Public manifest; installer from the vendor URL in the manifest
+    $manifest = Invoke-RestMethod -Uri $ManifestUrl
+    $installerPath = Join-Path $work $manifest.installer
+    Write-Host "Downloading $($manifest.installer) from $($manifest.downloadUrl) ..."
+    Invoke-WebRequest -Uri $manifest.downloadUrl -OutFile $installerPath -UseBasicParsing
+} else {
+    # 1. Get a storage token from the build VM's managed identity (IMDS)
+    $token = (Invoke-RestMethod -Headers @{ Metadata = 'true' } -Uri `
+        'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/').access_token
+    $headers = @{ Authorization = "Bearer $token"; 'x-ms-version' = '2021-08-06' }
+    $base = "https://$StorageAccount.blob.core.windows.net/$Container/apps/$AppName"
+    # 2. Read the manifest and download the installer
+    $manifest = Invoke-RestMethod -Uri "$base/app.json" -Headers $headers
+    $installerPath = Join-Path $work $manifest.installer
+    Write-Host "Downloading $($manifest.installer) ..."
+    Invoke-WebRequest -Uri "$base/$($manifest.installer)" -Headers $headers -OutFile $installerPath -UseBasicParsing
+}
 
 # 3. Run the silent install
 $cmd = $manifest.install -replace '\{installer\}', $installerPath

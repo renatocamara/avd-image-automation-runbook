@@ -24,6 +24,10 @@
 .EXAMPLE
     .\New-AvdImageTemplate.ps1 -SubscriptionId <sub> -ResourceGroup rg-avd-img-test-lab -Location westus3
 .EXAMPLE
+    # Lab without a storage account (public repo): customizers from raw GitHub, apps from their downloadUrl
+    .\New-AvdImageTemplate.ps1 -ResourceGroup rg-avd-img-test-lab -Location westus3 `
+        -ScriptBaseUrl https://raw.githubusercontent.com/renatocamara/avd-image-automation-runbook/main
+.EXAMPLE
     .\New-AvdImageTemplate.ps1 -ResourceGroup rg-avd-img-test-lab -Languages "de-DE" -Apps @() -MonitorOnly
 #>
 [CmdletBinding()]
@@ -44,6 +48,7 @@ param(
     [string]$BuildVmSize     = "Standard_D4as_v5",               # x64, SCSI; falls back if restricted
     [int]$BuildTimeoutMinutes = 360,
     [string]$SubnetId        = "",                               # optional: existing subnet resource ID
+    [string]$ScriptBaseUrl   = "",                               # optional: public base URL for customizers/ and apps/ (e.g. raw GitHub); skips the storage account
     [switch]$SkipBuild,                                          # create the template only
     [switch]$MonitorOnly                                         # attach to a running build
 )
@@ -149,62 +154,79 @@ $feat = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryNa
 Pass "definition $ImageDefinition features: $($feat -join ' | ')"
 
 # =============================================================================================
+if ($ScriptBaseUrl) {
+    Step "3. Scripts and installers from $ScriptBaseUrl (no storage account)"
+    $ScriptBaseUrl = $ScriptBaseUrl.TrimEnd('/')
+    foreach ($f in 'customizers/Install-Languages.ps1', 'customizers/Install-App.ps1', 'customizers/Sysprep-Cleanup.ps1') {
+        try { $null = Invoke-WebRequest -Uri "$ScriptBaseUrl/$f" -UseBasicParsing -Method Head } catch { Fail "$ScriptBaseUrl/$f is not reachable" }
+    }
+    Pass "customizers reachable; apps will be downloaded from the downloadUrl in each app.json"
+} else {
 Step "3. Storage account with customizers and installers"
-# public endpoint on purpose: the build VM lives in Image Builder's own network and reads the blobs with
-# the managed identity (no anonymous access). Some subscriptions default new accounts to Deny, so set it explicitly.
-az storage account create -n $StorageAccount -g $ResourceGroup -l $Location --sku Standard_LRS --kind StorageV2 `
-    --allow-blob-public-access false --min-tls-version TLS1_2 --public-network-access Enabled --default-action Allow `
-    --bypass AzureServices --only-show-errors -o none
-az storage account update -n $StorageAccount -g $ResourceGroup --public-network-access Enabled --default-action Allow --bypass AzureServices -o none
-$net = az storage account show -n $StorageAccount -g $ResourceGroup --query "[publicNetworkAccess, networkRuleSet.defaultAction]" -o tsv
-if (($net -join ' ') -notmatch 'Enabled\s+Allow') { Fail "storage account network rules are '$($net -join '/')'; a policy may enforce Deny. Use -SubnetId with a Storage service endpoint, or allow public access on $StorageAccount" }
-$saId = az storage account show -n $StorageAccount -g $ResourceGroup --query id -o tsv
-$ErrorActionPreference = "Continue"
-az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role "Storage Blob Data Reader" --scope $saId -o none 2>$null
-$me = az ad signed-in-user show --query id -o tsv 2>$null
-if ($me) { az role assignment create --assignee-object-id $me --assignee-principal-type User --role "Storage Blob Data Contributor" --scope $saId -o none 2>$null }
-$ErrorActionPreference = "Stop"
-az storage container create -n $Container --account-name $StorageAccount --auth-mode login --only-show-errors -o none
-# upload with retry: the Blob Data Contributor assignment can take a minute to apply
-function Upload-Blob($file, $name) {
-    for ($i = 1; $i -le 6; $i++) {
-        az storage blob upload --account-name $StorageAccount -c $Container -f $file -n $name --auth-mode login --overwrite --only-show-errors -o none 2>$null
-        if ($LASTEXITCODE -eq 0) { return }
-        Write-Host "    upload of $name failed (attempt $i), waiting 20 s for role propagation"; Start-Sleep 20
+    # public endpoint on purpose: the build VM lives in Image Builder's own network and reads the blobs with
+    # the managed identity (no anonymous access). Some subscriptions default new accounts to Deny, so set it explicitly.
+    az storage account create -n $StorageAccount -g $ResourceGroup -l $Location --sku Standard_LRS --kind StorageV2 `
+        --allow-blob-public-access false --min-tls-version TLS1_2 --public-network-access Enabled --default-action Allow `
+        --bypass AzureServices --only-show-errors -o none
+    az storage account update -n $StorageAccount -g $ResourceGroup --public-network-access Enabled --default-action Allow --bypass AzureServices -o none
+    $net = az storage account show -n $StorageAccount -g $ResourceGroup --query "[publicNetworkAccess, networkRuleSet.defaultAction]" -o tsv
+    if (($net -join ' ') -notmatch 'Enabled\s+Allow') { Fail "storage account network rules are '$($net -join '/')'; a policy may enforce Deny. Use -SubnetId with a Storage service endpoint, or allow public access on $StorageAccount" }
+    $saId = az storage account show -n $StorageAccount -g $ResourceGroup --query id -o tsv
+    $ErrorActionPreference = "Continue"
+    az role assignment create --assignee-object-id $principalId --assignee-principal-type ServicePrincipal --role "Storage Blob Data Reader" --scope $saId -o none 2>$null
+    $me = az ad signed-in-user show --query id -o tsv 2>$null
+    if ($me) { az role assignment create --assignee-object-id $me --assignee-principal-type User --role "Storage Blob Data Contributor" --scope $saId -o none 2>$null }
+    $ErrorActionPreference = "Stop"
+    az storage container create -n $Container --account-name $StorageAccount --auth-mode login --only-show-errors -o none
+    # upload with retry: the Blob Data Contributor assignment can take a minute to apply
+    function Upload-Blob($file, $name) {
+        for ($i = 1; $i -le 6; $i++) {
+            az storage blob upload --account-name $StorageAccount -c $Container -f $file -n $name --auth-mode login --overwrite --only-show-errors -o none 2>$null
+            if ($LASTEXITCODE -eq 0) { return }
+            Write-Host "    upload of $name failed (attempt $i), waiting 20 s for role propagation"; Start-Sleep 20
+        }
+        Fail "could not upload $name to $StorageAccount/$Container"
     }
-    Fail "could not upload $name to $StorageAccount/$Container"
-}
-foreach ($f in 'Install-Languages.ps1', 'Install-App.ps1', 'Sysprep-Cleanup.ps1') { Upload-Blob (Join-Path $here "customizers\$f") "customizers/$f" }
-foreach ($app in $Apps) {
-    $dir = Join-Path $here "apps\$app"
-    $manifest = Get-Content (Join-Path $dir "app.json") -Raw | ConvertFrom-Json
-    $installer = Join-Path $dir $manifest.installer
-    if (-not (Test-Path $installer)) {
-        Write-Host "    downloading $($manifest.installer) from $($manifest.downloadUrl)"
-        $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri $manifest.downloadUrl -OutFile $installer -UseBasicParsing
+    foreach ($f in 'Install-Languages.ps1', 'Install-App.ps1', 'Sysprep-Cleanup.ps1') { Upload-Blob (Join-Path $here "customizers\$f") "customizers/$f" }
+    foreach ($app in $Apps) {
+        $dir = Join-Path $here "apps\$app"
+        $manifest = Get-Content (Join-Path $dir "app.json") -Raw | ConvertFrom-Json
+        $installer = Join-Path $dir $manifest.installer
+        if (-not (Test-Path $installer)) {
+            Write-Host "    downloading $($manifest.installer) from $($manifest.downloadUrl)"
+            $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri $manifest.downloadUrl -OutFile $installer -UseBasicParsing
+        }
+        Upload-Blob (Join-Path $dir "app.json") "apps/$app/app.json"
+        Upload-Blob $installer "apps/$app/$($manifest.installer)"
     }
-    Upload-Blob (Join-Path $dir "app.json") "apps/$app/app.json"
-    Upload-Blob $installer "apps/$app/$($manifest.installer)"
+    Pass "uploaded customizers and $($Apps.Count) app(s) to $StorageAccount/$Container"
 }
-Pass "uploaded customizers and $($Apps.Count) app(s) to $StorageAccount/$Container"
 
 # =============================================================================================
 Step "4. Template $TemplateName"
-$blobBase = "https://$StorageAccount.blob.core.windows.net/$Container"
-# each customizer: get a storage token from IMDS (template identity), download the script, run it
+# each customizer downloads its script and runs it. Storage mode: token from IMDS (template identity).
+# URL mode: plain public download (lab only).
 function Script-Customizer($name, $script, $argLine) {
-    @{
-        type = "PowerShell"; name = $name; runElevated = $true; runAsSystem = $true
-        inline = @(
+    if ($ScriptBaseUrl) {
+        $inline = @(
+            "`$ProgressPreference='SilentlyContinue'",
+            "Invoke-WebRequest -Uri '$ScriptBaseUrl/customizers/$script' -OutFile C:\Windows\Temp\$script -UseBasicParsing",
+            "& C:\Windows\Temp\$script $argLine")
+    } else {
+        $blobBase = "https://$StorageAccount.blob.core.windows.net/$Container"
+        $inline = @(
             "`$ProgressPreference='SilentlyContinue'",
             "`$t=(Invoke-RestMethod -Headers @{Metadata='true'} -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/').access_token",
             "Invoke-WebRequest -Uri '$blobBase/customizers/$script' -Headers @{Authorization=""Bearer `$t"";'x-ms-version'='2021-08-06'} -OutFile C:\Windows\Temp\$script -UseBasicParsing",
-            "& C:\Windows\Temp\$script $argLine"
-        )
+            "& C:\Windows\Temp\$script $argLine")
     }
+    @{ type = "PowerShell"; name = $name; runElevated = $true; runAsSystem = $true; inline = $inline }
 }
 $customize = @()
-foreach ($app in $Apps) { $customize += Script-Customizer "App-$app" "Install-App.ps1" "-StorageAccount '$StorageAccount' -Container '$Container' -AppName '$app'" }
+foreach ($app in $Apps) {
+    $appArgs = if ($ScriptBaseUrl) { "-ManifestUrl '$ScriptBaseUrl/apps/$app/app.json' -AppName '$app'" } else { "-StorageAccount '$StorageAccount' -Container '$Container' -AppName '$app'" }
+    $customize += Script-Customizer "App-$app" "Install-App.ps1" $appArgs
+}
 if ($Languages.Count -gt 0) {
     $customize += Script-Customizer "InstallLanguages" "Install-Languages.ps1" "-Languages '$($Languages -join ',')'"
     $customize += @{ type = "WindowsRestart"; name = "RestartAfterLanguages"; restartTimeout = "30m" }
@@ -256,7 +278,7 @@ az resource create -g $ResourceGroup -n $TemplateName --resource-type Microsoft.
     --api-version $apiVersion --is-full-object --properties "@$outFile" --only-show-errors -o none
 $prov = az resource show --ids $templateId --query "properties.provisioningState" -o tsv
 if ($prov -ne 'Succeeded') { Fail "template provisioning: $prov ($(az resource show --ids $templateId --query 'properties.provisioningError.message' -o tsv))" }
-Pass "template created: $($customize.Count) customizers (apps: $($Apps -join ','); languages: $($Languages -join ','); updates: $ApplyWindowsUpdates)"
+Pass "template created: $($customize.Count) customizers (apps: $($Apps -join ','); languages: $($Languages -join ','); updates: $ApplyWindowsUpdates; scripts from $(if ($ScriptBaseUrl) { $ScriptBaseUrl } else { $StorageAccount }))"
 if ($SkipBuild) { Write-Host "`n-SkipBuild: start it with  az resource invoke-action --action run --ids $templateId --no-wait"; exit 0 }
 
 # =============================================================================================
