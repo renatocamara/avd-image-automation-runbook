@@ -152,6 +152,13 @@ fr-FR 4 min, zh-CN 5 min (fonts included), 27 min end to end including reboot an
 languages reported by `Get-InstalledLanguage`, 21 language capabilities installed, cleanup tasks disabled.
 The previous attempt with `Install-Language` had timed out after 65 minutes on the first language.
 
+**Full Image Builder build** (`New-AvdImageTemplate.ps1 -ScriptBaseUrl ... -StagingResourceGroup ...`,
+same customizers, plus Windows Update and Sysprep): 91 minutes end to end, published as
+`win11-avd-template-tls/1.0.0`. A VM created from that version on `Standard_D4as_v7` reported
+NVMe disk controller, Secure Boot and vTPM on, `Get-InstalledLanguage` = de-DE, en-US, fr-FR, zh-CN
+(plus the und-Hans fonts), 7-Zip present, LPRemove task disabled, build 25H2 26200. So the output of the
+template boots on the NVMe-only Dasv7 family with no re-capture step.
+
 ### Why the language step uses the ISO and not `Install-Language`
 
 The first build with languages failed after 65 minutes with "The operation has timed out" inside
