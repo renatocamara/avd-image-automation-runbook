@@ -126,8 +126,9 @@ if ($existing) {
 
 # ---------------------------------------------------------------------------------------------
 Step "3. Install applications ($mode)"
+if ($Apps.Count -eq 0) { Write-Host "    no applications requested" }
 $sas = ""
-if ($StorageAccount) {
+if ($StorageAccount -and $Apps.Count -gt 0) {
     $expiry = (Get-Date).ToUniversalTime().AddHours(3).ToString("yyyy-MM-ddTHH:mmZ")
     $sas = az storage container generate-sas --account-name $StorageAccount -n $Container --permissions r `
         --expiry $expiry --auth-mode login --as-user -o tsv
@@ -191,10 +192,12 @@ if ($LASTEXITCODE -ne 0) { Fail "capture / boot test failed (see above)" }
 
 # ---------------------------------------------------------------------------------------------
 Step "6. Applications on the NEW image (inside the test VM)"
-$checks = ($Apps | ForEach-Object { "'$_=' + (Test-Path '$($manifests[$_].validate)')" }) -join "`n"
-$out = Invoke-OnVm $ResourceGroup "vm-gold-test" $checks
-$out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
-foreach ($app in $Apps) { if ($out -notmatch "$([regex]::Escape($app))=True") { Fail "$app not found on the new image (test VM vm-gold-test kept for inspection)" } }
+if ($Apps.Count -gt 0) {
+    $checks = ($Apps | ForEach-Object { "'$_=' + (Test-Path '$($manifests[$_].validate)')" }) -join "`n"
+    $out = Invoke-OnVm $ResourceGroup "vm-gold-test" $checks
+    $out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
+    foreach ($app in $Apps) { if ($out -notmatch "$([regex]::Escape($app))=True") { Fail "$app not found on the new image (test VM vm-gold-test kept for inspection)" } }
+} else { Write-Host "    no applications requested" }
 az vm delete -g $ResourceGroup -n vm-gold-test --yes -o none
 Pass "all applications present on $NewVersion; test VM deleted"
 
