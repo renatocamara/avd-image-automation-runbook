@@ -86,6 +86,11 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $pw = [System.Net.NetworkCredential]::new("", $AdminPassword).Password
+$classes = @('[a-z]', '[A-Z]', '\d', '[^a-zA-Z\d]') | Where-Object { $pw -cmatch $_ }
+if ($pw.Length -lt 12 -or $pw.Length -gt 123 -or @($classes).Count -lt 3) {
+    Write-Host "  FAIL  the admin password does not meet Azure rules (12-123 characters, and 3 of: lower case, upper case, number, special character)" -ForegroundColor Red; exit 1
+}
+$env:AZURE_CORE_DISPLAY_REGION_IDENTIFIED = "false"
 $useExistingVm = [bool]$SourceVmName
 $srcVm  = if ($useExistingVm) { $SourceVmName } else { "vm-gold-src" }
 $srcRg  = if ($SourceVmResourceGroup) { $SourceVmResourceGroup } else { $ResourceGroup }
@@ -133,11 +138,17 @@ Pass "$SourceVmSize available (source VM)"
 Step "1. Resource group, gallery, image definitions (Gen2, SCSI+NVMe)"
 az group create -n $ResourceGroup -l $Location -o none
 az sig create -g $ResourceGroup --gallery-name $GalleryName -l $Location -o none
+# create the definition only if it does not exist (an existing one may have another publisher/offer/sku, which cannot change)
+$ErrorActionPreference = "Continue"
+$defExists = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --query name -o tsv 2>$null
+$ErrorActionPreference = "Stop"
+if (-not $defExists) {
 az sig image-definition create -g $ResourceGroup --gallery-name $GalleryName `
     --gallery-image-definition $ImageDefinition `
     --publisher "LabAVD" --offer "Win11-AVD" --sku "goldimage-tl" `
     --os-type Windows --os-state Generalized --hyper-v-generation V2 `
     --features "SecurityType=TrustedLaunch DiskControllerTypes=SCSI,NVMe" -l $Location -o none
+}
 $feat = az sig image-definition show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --query "features" -o json
 Pass "re-capture definition $ImageDefinition features: $feat"
 if (-not $SkipExperiment) {

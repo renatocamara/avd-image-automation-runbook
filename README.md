@@ -188,6 +188,16 @@ $pw = Read-Host -AsSecureString "Admin password for the temporary VMs"
     -ImageDefinition <nvme-definition> -NewVersion 2026.2.0 -Apps 7zip -SubnetId <subnet-id> -EnableTimeZoneRedirection
 ```
 
+Optional settings written into the image: `-EnableTimeZoneRedirection`, and `-FSLogixVhdLocation \\<account>.file.core.windows.net\<share>`
+for the FSLogix profile container (Enabled, VHDLocations, VHDX, dynamic 30 GB, local profile replaced, retry
+settings). Both are verified again inside a VM built from the new version. The share permissions and the
+storage account's AD authentication are prerequisites, not done by the script.
+
+Each run starts from the latest version, so pass only what changes in that run (the new app, a new setting).
+The password is checked against Azure's complexity rules before anything is created. Run the script from a
+regular PowerShell window, Windows Terminal or VS Code: PowerShell ISE turns informational Azure CLI messages
+into errors and stops it.
+
 Measured in the lab (Windows 11 25H2 multi-session, build VM `Standard_D4as_v4`, test VM `Standard_D4as_v7`):
 26 minutes end to end. 7-Zip installed and validated, time zone redirection set, Sysprep, capture, NVMe /
 Secure Boot / vTPM on Dasv7, and `7zip=True` on the new version.
