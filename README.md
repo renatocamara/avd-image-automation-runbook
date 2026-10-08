@@ -169,6 +169,29 @@ pack `.cab` plus the Features on Demand with `-Source <iso> -LimitAccess`: fully
 per language. Windows Update runs once, after the languages, and brings them to the image's patch level.
 It also disables the cleanup tasks that would otherwise remove unused language packs on the hosts.
 
+## New gold image version in one command: `Update-GoldImage.ps1`
+
+For every image change after the first: start from the latest version in the NVMe-capable definition,
+install applications by script, apply settings, Sysprep, capture the next version, boot test on Dasv7, and
+verify the applications inside a VM built from the **new** version. Then roll out with
+*Host pool > Session host configuration > Update*.
+
+Applications are described by `apps/<name>/app.json` (installer, silent install command, file that proves the
+install). Installers come from the manifest's `downloadUrl`, or from your own storage account with
+`-StorageAccount <account> -Container <container>` (blob path `<container>/<app>/<installer>`). In storage mode
+the script creates a read-only user delegation SAS valid for 3 hours: no account keys, no identity on the VM.
+The person running it needs *Storage Blob Data Reader* on the account; the build VM needs a network path to it.
+
+```powershell
+$pw = Read-Host -AsSecureString "Admin password for the temporary VMs"
+.\Update-GoldImage.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -Location <region> -GalleryName <gallery> `
+    -ImageDefinition <nvme-definition> -NewVersion 2026.2.0 -Apps 7zip -SubnetId <subnet-id> -EnableTimeZoneRedirection
+```
+
+Measured in the lab (Windows 11 25H2 multi-session, build VM `Standard_D4as_v4`, test VM `Standard_D4as_v7`):
+26 minutes end to end. 7-Zip installed and validated, time zone redirection set, Sysprep, capture, NVMe /
+Secure Boot / vTPM on Dasv7, and `7zip=True` on the new version.
+
 ## Cleanup
 
 ```powershell

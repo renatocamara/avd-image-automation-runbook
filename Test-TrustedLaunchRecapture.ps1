@@ -314,7 +314,7 @@ Pass "CHECKPOINT C: boots on $TestVmSize with NVMe, Secure Boot, vTPM$(if ($useE
 $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes)
 Write-Host "`nALL CHECKPOINTS PASSED in $mins min." -ForegroundColor Green
 Write-Host "Re-capturing an existing Trusted Launch gold image into a TrustedLaunch + SCSI,NVMe definition works,"
-Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. $(if ($useExistingVm) { 'Source VM ' + $srcVm + ' is now generalized (not bootable); the pre-Sysprep snapshot is the way back.' } else { 'Applications carry over (marker present).' })"
+Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. $(if ($useExistingVm) { 'Source VM ' + $srcVm + ' is now generalized (not bootable)' + $(if ($SkipSnapshot) { '.' } else { '; the pre-Sysprep snapshot is the way back.' }) } else { 'Applications carry over (marker present).' })"
 Write-Host "This version can be used for session hosts / session host update, but NOT as a Custom Image Template source."
 Write-Host "Captured version ID:"
 Write-Host "  $verId"
