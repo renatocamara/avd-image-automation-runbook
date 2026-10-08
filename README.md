@@ -201,6 +201,7 @@ into errors and stops it.
 Measured in the lab (Windows 11 25H2 multi-session, build VM `Standard_D4as_v4`, test VM `Standard_D4as_v7`):
 26 minutes end to end. 7-Zip installed and validated, time zone redirection set, Sysprep, capture, NVMe /
 Secure Boot / vTPM on Dasv7, and `7zip=True` on the new version.
+FSLogix option, same lab: 27 minutes end to end, settings verified inside a VM built from the new version.
 
 ## Cleanup
 
