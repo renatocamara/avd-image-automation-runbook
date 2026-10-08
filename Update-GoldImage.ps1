@@ -12,7 +12,7 @@
            - Internet mode (default): installer downloaded from the manifest's downloadUrl
            - Storage mode (-StorageAccount): installer read from <container>/<name>/<installer> through a
              short-lived, read-only user delegation SAS. No storage keys, no identity on the VM.
-      4. Optional settings (-EnableTimeZoneRedirection)
+      4. Optional settings (-EnableTimeZoneRedirection, -FSLogixVhdLocation)
       5. Sysprep, capture as -NewVersion and boot test on -TestVmSize, using Test-TrustedLaunchRecapture.ps1
       6. Applications verified inside a VM created from the NEW version; test VM deleted
 
@@ -24,6 +24,14 @@
                            The person running the script needs "Storage Blob Data Reader" on the account (to
                            create the SAS); the build VM needs a network path to it (public or private endpoint).
 .PARAMETER Container       Blob container with the installers (default: installers).
+.PARAMETER FSLogixVhdLocation
+                           OPTIONAL. UNC path of the FSLogix profile share, e.g. \\<account>.file.core.windows.net\<share>.
+                           When set, the FSLogix profile container settings are written into the image (Enabled,
+                           VHDLocations, VHDX, dynamic 30 GB, local profile replaced, retry settings). Share permissions
+                           and the storage account's AD authentication are NOT configured by this script.
+.NOTES
+    Run it from a regular PowerShell window, Windows Terminal or VS Code. PowerShell ISE turns informational
+    Azure CLI messages on stderr into errors and stops the script.
 
 .EXAMPLE
     $pw = Read-Host -AsSecureString "Admin password for the temporary VMs"
@@ -51,10 +59,18 @@ param(
     [string]$VmSize          = "Standard_D4as_v5",
     [string]$TestVmSize      = "Standard_D4as_v7",
     [string]$SubnetId        = "",                         # recommended: the session hosts' subnet
-    [switch]$EnableTimeZoneRedirection
+    [switch]$EnableTimeZoneRedirection,
+    [string]$FSLogixVhdLocation = ""                     # e.g. \\account.file.core.windows.net\profiles
 )
 $ErrorActionPreference = "Stop"
 $pw = [System.Net.NetworkCredential]::new("", $AdminPassword).Password
+# Azure rules for VM admin passwords: 12-123 characters and 3 of: lower, upper, digit, special. Check now, not after 20 min.
+$classes = @('[a-z]', '[A-Z]', '\d', '[^a-zA-Z\d]') | Where-Object { $pw -cmatch $_ }
+if ($pw.Length -lt 12 -or $pw.Length -gt 123 -or @($classes).Count -lt 3) {
+    Write-Host "  FAIL  the admin password does not meet Azure rules (12-123 characters, and 3 of: lower case, upper case, number, special character)" -ForegroundColor Red; exit 1
+}
+# informational CLI messages on stderr (region recommendations) stop scripts in some hosts; switch them off for this run
+$env:AZURE_CORE_DISPLAY_REGION_IDENTIFIED = "false"
 if (-not $VmResourceGroup) { $VmResourceGroup = $ResourceGroup }
 $t0 = Get-Date
 function Step($msg) { Write-Host ("`n[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg) -ForegroundColor Cyan }
@@ -169,7 +185,31 @@ Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
 '@
     if ($out -notmatch 'TZ=1') { Fail "time zone redirection not set: $out" }
     Pass "time zone redirection enabled"
-} else { Write-Host "    none requested" }
+}
+if ($FSLogixVhdLocation) {
+    $loc = $FSLogixVhdLocation -replace "'", "''"
+    $out = Invoke-OnVm $VmResourceGroup $VmName @"
+`$k = 'HKLM:\SOFTWARE\FSLogix\Profiles'
+New-Item `$k -Force | Out-Null
+Set-ItemProperty `$k -Name Enabled -Value 1 -Type DWord
+New-ItemProperty `$k -Name VHDLocations -Value @('$loc') -PropertyType MultiString -Force | Out-Null
+Set-ItemProperty `$k -Name VolumeType -Value 'VHDX' -Type String
+Set-ItemProperty `$k -Name SizeInMBs -Value 30000 -Type DWord
+Set-ItemProperty `$k -Name IsDynamic -Value 1 -Type DWord
+Set-ItemProperty `$k -Name DeleteLocalProfileWhenVHDShouldApply -Value 1 -Type DWord
+Set-ItemProperty `$k -Name FlipFlopProfileDirectoryName -Value 1 -Type DWord
+Set-ItemProperty `$k -Name LockedRetryCount -Value 3 -Type DWord
+Set-ItemProperty `$k -Name LockedRetryInterval -Value 15 -Type DWord
+Set-ItemProperty `$k -Name ReAttachRetryCount -Value 3 -Type DWord
+Set-ItemProperty `$k -Name ReAttachIntervalSeconds -Value 15 -Type DWord
+`$p = Get-ItemProperty `$k
+"FSLOGIX=" + `$p.Enabled + " AGENT=" + (Test-Path 'C:\Program Files\FSLogix\Apps\frx.exe') + " VHD=" + (`$p.VHDLocations -join ';')
+"@
+    if ($out -notmatch 'FSLOGIX=1') { Fail "FSLogix settings not applied: $out" }
+    if ($out -notmatch 'AGENT=True') { Write-Host "    WARNING: FSLogix agent not found on the image; settings written but profiles need the agent" -ForegroundColor Yellow }
+    Pass "FSLogix profile container -> $FSLogixVhdLocation"
+}
+if (-not $EnableTimeZoneRedirection -and -not $FSLogixVhdLocation) { Write-Host "    none requested" }
 
 # a VM fresh from a generalized image can still be servicing for a few minutes; Sysprep must wait for it
 Write-Host "    waiting for Windows servicing to be idle before Sysprep..."
@@ -198,8 +238,13 @@ if ($Apps.Count -gt 0) {
     $out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
     foreach ($app in $Apps) { if ($out -notmatch "$([regex]::Escape($app))=True") { Fail "$app not found on the new image (test VM vm-gold-test kept for inspection)" } }
 } else { Write-Host "    no applications requested" }
+if ($FSLogixVhdLocation) {
+    $out = Invoke-OnVm $ResourceGroup "vm-gold-test" "'FSLOGIX=' + (Get-ItemProperty 'HKLM:\SOFTWARE\FSLogix\Profiles' -ErrorAction SilentlyContinue).Enabled"
+    if ($out -notmatch 'FSLOGIX=1') { Fail "FSLogix settings not found on the new image (test VM vm-gold-test kept for inspection)" }
+    Pass "FSLogix settings present on $NewVersion"
+}
 az vm delete -g $ResourceGroup -n vm-gold-test --yes -o none
-Pass "all applications present on $NewVersion; test VM deleted"
+Pass "all requested applications and settings present on $NewVersion; test VM deleted"
 
 # ---------------------------------------------------------------------------------------------
 $verId = az sig image-version show -g $ResourceGroup --gallery-name $GalleryName --gallery-image-definition $ImageDefinition --gallery-image-version $NewVersion --query id -o tsv
