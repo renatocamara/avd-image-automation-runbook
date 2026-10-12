@@ -214,6 +214,7 @@ if (-not $EnableTimeZoneRedirection -and -not $FSLogixVhdLocation) { Write-Host 
 # a VM fresh from a generalized image can still be servicing for a few minutes; Sysprep must wait for it
 Write-Host "    waiting for Windows servicing to be idle before Sysprep..."
 $deadline = (Get-Date).AddMinutes(20)
+# (Test-TrustedLaunchRecapture.ps1 checks again right before Sysprep and waits if servicing restarted)
 do {
     $busy = (Invoke-OnVm $VmResourceGroup $VmName "((Get-Process | Where-Object Name -match '^(dism|TiWorker|lpksetup)$').Name | Sort-Object -Unique) -join ','").Trim()
     if ($busy) { Write-Host "    $(Get-Date -Format HH:mm:ss) busy: $busy"; Start-Sleep 60 }

@@ -189,10 +189,16 @@ if ($useExistingVm) {
     if ($ps -ne 'PowerState/running') { Fail "$srcVm is $ps; it must be running (start it, finish any installs, then re-run)" }
     $sec = az vm show -g $srcRg -n $srcVm --query "securityProfile.securityType" -o tsv
     if ($sec -ne 'TrustedLaunch') { Fail "$srcVm securityType is '$sec'; this flow expects TrustedLaunch" }
-    # servicing still running (TiWorker/dism) is the classic cause of a broken Sysprep
-    $busy = az vm run-command invoke -g $srcRg -n $srcVm --command-id RunPowerShellScript `
-        --scripts "((Get-Process | Where-Object Name -match '^(dism|TiWorker|lpksetup|sysprep)$').Name -join ',')" --query "value[0].message" -o tsv
-    if ($busy -and $busy.Trim()) { Fail "$srcVm is still busy ($($busy.Trim())); wait for servicing to finish and re-run" }
+    # servicing still running (TiWorker/dism) is the classic cause of a broken Sysprep.
+    # Windows can start a new servicing task at any time, so wait (up to 30 min) instead of failing.
+    $deadline = (Get-Date).AddMinutes(30)
+    do {
+        $busy = az vm run-command invoke -g $srcRg -n $srcVm --command-id RunPowerShellScript `
+            --scripts "((Get-Process | Where-Object Name -match '^(dism|TiWorker|lpksetup|sysprep)$').Name | Sort-Object -Unique) -join ','" --query "value[0].message" -o tsv
+        $busy = if ($busy) { $busy.Trim() } else { '' }
+        if ($busy) { Write-Host "    $(Get-Date -Format HH:mm:ss) waiting, busy: $busy"; Start-Sleep 60 }
+    } while ($busy -and (Get-Date) -lt $deadline)
+    if ($busy) { Fail "$srcVm still busy after 30 min ($busy); wait for servicing to finish and re-run" }
     Pass "$srcVm is running, Trusted Launch, idle"
     if (-not $SkipSnapshot) {
         $osDisk = az vm show -g $srcRg -n $srcVm --query "storageProfile.osDisk.managedDisk.id" -o tsv
