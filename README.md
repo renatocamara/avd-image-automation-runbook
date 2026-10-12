@@ -1,215 +1,190 @@
 # AVD Image Automation Runbook
 
-Fast, public-by-default validation of one question for Azure Virtual Desktop gold images:
+PowerShell scripts to build, update and test **Azure Virtual Desktop gold images** without manual VM work,
+and to roll new versions out to session hosts with **session host update** instead of rebuilding hosts by hand.
 
-> Can an existing **Trusted Launch** gold image be re-captured into a new Compute Gallery definition
-> that allows NVMe (`DiskControllerTypes = SCSI, NVMe`) and run on an **NVMe-only** VM size (Dasv7)
-> with Trusted Launch enabled, keeping its installed applications?
+Built and validated end to end in a lab subscription. Every script prints one `PASS` / `FAIL` line per step
+and stops at the first failure.
 
-## Finding so far
+## What problem this solves
 
-The first run answered a second question on the way. Capturing a Trusted Launch VM into a
-**`TrustedLaunchSupported`** definition is refused by the platform:
+A typical AVD environment that grew over time looks like this:
 
+- The gold image is prepared by hand on a VM, then Sysprep'd and captured.
+- Session hosts are rebuilt manually every time the image changes, with AD cleanup afterwards.
+- Display languages take hours to install and sometimes time out.
+- The image cannot move to the newer **NVMe-only** VM sizes (for example Dasv7).
+- The image is **Trusted Launch**, so the AVD **Custom Image Template** wizard refuses it as a source.
+
+This repository takes such an environment to the current AVD model:
+
+| Before | After |
+|---|---|
+| Gold image built by hand | New image version from **one command**: apps installed by script, settings applied, Sysprep, capture, test |
+| Hosts rebuilt manually for every change | **Session host update**: one update in the portal, the service drains, rebuilds and re-registers the hosts |
+| Image only runs on SCSI sizes | Image definition that supports **SCSI and NVMe**, tested on Dasv7 |
+| Language packs time out | **Offline install** from the Microsoft language ISO, about 5 minutes per language |
+| No repeatable build | Optional **Custom Image Template** build from the Marketplace image |
+
+> Session host configuration, session host update and dynamic autoscaling were in preview from late 2024 and
+> became generally available in mid 2026. Many environments were built before that, on the manual model.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    A[Current Trusted Launch<br/>gold image] -->|1. Test-TrustedLaunchRecapture.ps1<br/>one time| B[NVMe-capable definition<br/>version N]
+    B --> C[Host pool with<br/>session host configuration]
+    B -->|2. Update-GoldImage.ps1<br/>every change| D[version N+1<br/>apps + settings]
+    D -->|session host update| C
+    E[Marketplace image] -->|3. New-AvdImageTemplate.ps1<br/>optional, full rebuild| F[Template definition<br/>TrustedLaunchSupported]
+    F -->|session host update| C
 ```
-(Conflict) The source '.../virtualMachines/vm-gold-src' contains TrustedLaunch or ConfidentialVM
-security data that cannot be used in image with 'TrustedLaunchSupported' security type.
-Please use either TrustedLaunch or ConfidentialVM security type.
-```
 
-Combined with the Image Builder limitation (it accepts `TrustedLaunchSupported` sources but not
-`TrustedLaunch`, [documentation](https://learn.microsoft.com/en-us/azure/virtual-machines/image-builder-overview#confidential-vm-and-trusted-launch-support)),
-this means:
+Three paths, one script each:
 
-| Goal | Works? | How |
-|---|---|---|
-| Move the current gold image (apps included) to Dasv7 / NVMe, and use session host update | Yes (checkpoints A, B, C) | Re-capture it into a new `TrustedLaunch` + `SCSI, NVMe` definition |
-| Use the current gold image as the source of a Custom Image Template | No | Image Builder cannot take a `TrustedLaunch` image, and the image cannot be re-captured as `TrustedLaunchSupported` |
-| Automated, repeatable builds (Custom Image Template) | Yes | Start from the Marketplace image and install applications and languages with scripts |
+| # | Goal | Script | When | Lab time |
+|---|---|---|---|---|
+| 1 | Move the existing gold image to an NVMe-capable definition and prove it boots on Dasv7 | `Test-TrustedLaunchRecapture.ps1` | Once | 35 to 50 min |
+| 2 | Produce the next image version: install apps, apply settings, capture, test | `Update-GoldImage.ps1` | Every image change | about 27 min |
+| 3 | Rebuild the image from scratch with Azure VM Image Builder | `New-AvdImageTemplate.ps1` | Optional, long term | about 90 min |
 
-The script also tries the snapshot route (OS disk snapshot into a `TrustedLaunchSupported` definition)
-as a non-fatal experiment, step 4b, to close that door with evidence rather than assumption.
+Each new version is rolled out the same way: *Host pool > Session host configuration > Update*.
 
-## Run it
+## Prerequisites
 
-Requirements: PowerShell 7, Azure CLI, `az login`, Contributor on the subscription.
+- PowerShell 7 (Windows Terminal, VS Code or Azure Cloud Shell). Avoid PowerShell ISE: it turns informational
+  Azure CLI messages into errors and stops the scripts.
+- Azure CLI, signed in with `az login`, and the right subscription selected (`az account set`).
+- Contributor on the resource group that holds the Compute Gallery.
+- A subnet for the temporary VMs. Lab default: a temporary VNet with a NAT gateway. No VM ever gets a public IP;
+  everything inside the VMs runs through Azure Run Command.
+- An admin password for the temporary VMs: 12+ characters with 3 of lower case, upper case, number, special.
 
 ```powershell
-$pw = Read-Host -AsSecureString "Admin password for the lab VMs"
-.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup rg-avd-img-test-lab -Location westus3
+git clone https://github.com/renatocamara/avd-image-automation-runbook
+cd avd-image-automation-runbook
+$pw = Read-Host -AsSecureString "Admin password for the temporary VMs"
 ```
 
-About 35 to 50 minutes. The script prints one line per checkpoint and stops on the first failure.
+## 1. Move the existing gold image to NVMe (once)
+
+Creates a new gallery definition with `SecurityType = TrustedLaunch` and `DiskControllerTypes = SCSI, NVMe`,
+captures the current gold image into it, and boots a test VM on `Standard_D4as_v7`.
+
+```powershell
+$src = az sig image-version show -g <image-rg> --gallery-name <gallery> `
+    --gallery-image-definition <current-definition> --gallery-image-version <version> --query id -o tsv
+
+.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -Location <region> `
+    -GalleryName <gallery> -ImageDefinition <new-nvme-definition> -ImageVersion 2026.1.0 `
+    -SourceImageVersionId $src -SubnetId <subnet-id> -SkipExperiment
+```
 
 | Checkpoint | Proves |
 |---|---|
-| A | A Trusted Launch VM can be captured into a `TrustedLaunch` + `SCSI, NVMe` definition |
-| B | The captured version deploys on `Standard_D4as_v7` with Trusted Launch |
-| C | Inside that VM: NVMe controller, Secure Boot on, vTPM present, marker file from the source image present |
+| A | The Trusted Launch image is captured into the NVMe-capable definition |
+| B | A VM from the new version deploys on Dasv7 with Trusted Launch |
+| C | Inside that VM: NVMe controller, Secure Boot, vTPM, installed languages |
 
-> Region note: Dasv7 sizes are not offered in every region. Step 0 of the script checks that `Standard_D4as_v5` and `Standard_D4as_v7` are available and unrestricted in the chosen region and stops before creating anything if not. In our lab subscription `Standard_D4as_v7` was only available in **West US 3**, hence the default.
+Alternative source: `-SourceVmName <vm>` captures an existing, running, not Sysprep'd VM (a snapshot of its
+OS disk is taken first). Without `-SourceImageVersionId` or `-SourceVmName`, the script runs as a lab test
+from the Marketplace image.
 
-## Optional: run inside an existing VNet
+Then create (or update) the host pool with **session host configuration** pointing to this version.
 
-By default the script creates a small temporary VNet in the resource group. VMs never get a public IP;
-everything runs through Azure Run Command. To use your own subnet instead, pass its resource ID:
-
-```powershell
-$subnet = az network vnet subnet show -g <vnet-rg> --vnet-name <vnet> -n <subnet> --query id -o tsv
-.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -SubnetId $subnet
-```
-
-Nothing else changes. Pick whichever fits your environment.
-
-## Applying this to your real gold image
-
-Pass `-SourceImageVersionId` with the resource ID of your current gold image version. The script then
-creates the source VM from it (applications included) instead of the Marketplace image, and runs the same
-preparation, Sysprep, capture into the new `TrustedLaunch` + `SCSI, NVMe` definition, and Dasv7 test:
+## 2. New image version in one command (every change)
 
 ```powershell
-$src = az sig image-version show -g <rg> --gallery-name <gallery> --gallery-image-definition <current-def> --gallery-image-version <ver> --query id -o tsv
-.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <rg> -Location <region> `
-    -GalleryName <gallery> -ImageDefinition <new-nvme-def> -ImageVersion 2026.1.0 `
-    -SourceImageVersionId $src -SubnetId <your subnet id> -SkipExperiment
-```
-
-`-SkipExperiment` leaves out the `TrustedLaunchSupported` experiment definition (step 4b), which has no
-place in a real gallery. The script is safe to run in an existing resource group and gallery: it only adds
-the new definition, the new version and two temporary VMs (`vm-gold-src`, `vm-gold-test`), which must not
-exist beforehand.
-
-The marker file is still written (harmless) so checkpoint C stays identical. Add `-KeepSourceVm` if you
-want to inspect the generalized VM afterwards.
-
-## New gold image revision from a VM you built by hand
-
-This is the day-to-day flow once the NVMe definition exists: build the next gold image on a VM the way you
-do today (install, configure, do **not** Sysprep), then let the script do the rest:
-
-```powershell
-.\Test-TrustedLaunchRecapture.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -GalleryName <gallery> `
-    -ImageDefinition <nvme-definition> -ImageVersion 2026.2.0 `
-    -SourceVmName <gold-image-vm> -SourceVmResourceGroup <vm-rg> -SkipExperiment
-```
-
-With `-SourceVmName` the script: checks the VM is running, Trusted Launch and idle (no `TiWorker`/`dism`
-still servicing), snapshots its OS disk (`-SkipSnapshot` to skip), sets `stornvme` to start at boot, removes
-the per-user packages that block Sysprep, runs Sysprep, captures the VM into the definition as the given
-version, and boots a Dasv7 test VM to confirm NVMe, Secure Boot, vTPM and the installed languages. The source
-VM is never deleted, but it is generalized by Sysprep and will not boot again; the snapshot is the way back.
-The subnet is taken from the VM's NIC unless `-SubnetId` is given.
-
-Roll the new version out with **Session host update** on a host pool created with session host configuration.
-
-## Automated build: Custom Image Template (`New-AvdImageTemplate.ps1`)
-
-The other half of the picture: a repeatable build that starts from the Marketplace Windows 11
-multi-session image, installs applications by script, adds display languages, patches once, runs
-Sysprep cleanup and publishes to the gallery. One script, public resources, no Image Builder
-extension needed in the CLI.
-
-```powershell
-.\New-AvdImageTemplate.ps1 -SubscriptionId <sub> -ResourceGroup rg-avd-img-test-lab -Location westus3
-# attach to a running build
-.\New-AvdImageTemplate.ps1 -ResourceGroup rg-avd-img-test-lab -MonitorOnly
-```
-
-What it creates: managed identity + custom role, gallery definition `win11-avd-template-tls`
-(`TrustedLaunchSupported`, `SCSI, NVMe`: the only security type Image Builder can write to; VMs made from
-it still run with Trusted Launch), a storage account with the `customizers/` scripts and `apps/` installers,
-and the template resource tagged for the AVD portal blade. Then it starts the build and follows it.
-
-Customizer order: apps (`apps/<name>/app.json`, see 7-Zip), languages, restart, Windows Update, restart,
-Sysprep cleanup. `-Languages @()` or `-Apps @()` to leave a step out. `-SubnetId` to build inside an
-existing VNet.
-
-### If the build fails with "Key based authentication is not permitted on this storage account"
-
-Image Builder creates its own storage account in a staging resource group and talks to it with the
-storage key. A subscription policy that disables shared key access (or public network access) on
-storage accounts kills the build in the first minutes, before any customizer runs. Image Builder cannot
-work around it; the fix is a policy exemption on the staging resource group. Pass
-`-StagingResourceGroup <name>` so the template uses a fixed, dedicated and **empty** resource group you can
-exempt (Image Builder refuses a staging group that already has resources). Example exemption against an
-initiative assigned at management-group level, scoped to that resource group only:
-
-```powershell
-az group create -n rg-avd-img-staging -l <region> -o none
-az policy exemption create -n ex-imagebuilder-staging -g rg-avd-img-staging `
-  --policy-assignment "<assignment id from: az policy state list -g <rg> --filter \"PolicyDefinitionAction eq 'modify'\">" `
-  --policy-definition-reference-ids <shared-key reference id> <public-network reference id> `
-  --exemption-category Waiver --display-name "Image Builder staging storage"
-```
-If you cannot create exemptions in that subscription (shared or sandbox subscriptions), validate the
-customizers on a plain VM instead with `Test-CustomizersOnVm.ps1`, which runs the same scripts in the
-same order through Run Command, then capture that VM with `Test-TrustedLaunchRecapture.ps1 -SourceVmName`.
-
-### Measured result (lab, Windows 11 25H2 multi-session, Standard_D4as_v4)
-
-`Test-CustomizersOnVm.ps1` with 7-Zip plus de-DE, fr-FR and zh-CN: ISO download 6 min, de-DE 5 min,
-fr-FR 4 min, zh-CN 5 min (fonts included), 27 min end to end including reboot and verification. All three
-languages reported by `Get-InstalledLanguage`, 21 language capabilities installed, cleanup tasks disabled.
-The previous attempt with `Install-Language` had timed out after 65 minutes on the first language.
-
-**Full Image Builder build** (`New-AvdImageTemplate.ps1 -ScriptBaseUrl ... -StagingResourceGroup ...`,
-same customizers, plus Windows Update and Sysprep): 91 minutes end to end, published as
-`win11-avd-template-tls/1.0.0`. A VM created from that version on `Standard_D4as_v7` reported
-NVMe disk controller, Secure Boot and vTPM on, `Get-InstalledLanguage` = de-DE, en-US, fr-FR, zh-CN
-(plus the und-Hans fonts), 7-Zip present, LPRemove task disabled, build 25H2 26200. So the output of the
-template boots on the NVMe-only Dasv7 family with no re-capture step.
-
-### Why the language step uses the ISO and not `Install-Language`
-
-The first build with languages failed after 65 minutes with "The operation has timed out" inside
-`Install-Language de-DE`. On a patched image that cmdlet resolves every component through Windows
-Update, one at a time, and gives up after about an hour. `customizers/Install-Languages.ps1` instead
-downloads the Microsoft *Languages and Optional Features* ISO, mounts it, and installs the language
-pack `.cab` plus the Features on Demand with `-Source <iso> -LimitAccess`: fully offline, 10 to 15 minutes
-per language. Windows Update runs once, after the languages, and brings them to the image's patch level.
-It also disables the cleanup tasks that would otherwise remove unused language packs on the hosts.
-
-## New gold image version in one command: `Update-GoldImage.ps1`
-
-For every image change after the first: start from the latest version in the NVMe-capable definition,
-install applications by script, apply settings, Sysprep, capture the next version, boot test on Dasv7, and
-verify the applications inside a VM built from the **new** version. Then roll out with
-*Host pool > Session host configuration > Update*.
-
-Applications are described by `apps/<name>/app.json` (installer, silent install command, file that proves the
-install). Installers come from the manifest's `downloadUrl`, or from your own storage account with
-`-StorageAccount <account> -Container <container>` (blob path `<container>/<app>/<installer>`). In storage mode
-the script creates a read-only user delegation SAS valid for 3 hours: no account keys, no identity on the VM.
-The person running it needs *Storage Blob Data Reader* on the account; the build VM needs a network path to it.
-
-```powershell
-$pw = Read-Host -AsSecureString "Admin password for the temporary VMs"
 .\Update-GoldImage.ps1 -AdminPassword $pw -ResourceGroup <image-rg> -Location <region> -GalleryName <gallery> `
-    -ImageDefinition <nvme-definition> -NewVersion 2026.2.0 -Apps 7zip -SubnetId <subnet-id> -EnableTimeZoneRedirection
+    -ImageDefinition <nvme-definition> -NewVersion 2026.2.0 -SubnetId <subnet-id> `
+    -Apps 7zip -EnableTimeZoneRedirection
 ```
 
-Optional settings written into the image: `-EnableTimeZoneRedirection`, and `-FSLogixVhdLocation \\<account>.file.core.windows.net\<share>`
-for the FSLogix profile container (Enabled, VHDLocations, VHDX, dynamic 30 GB, local profile replaced, retry
-settings). Both are verified again inside a VM built from the new version. The share permissions and the
-storage account's AD authentication are prerequisites, not done by the script.
+What it does:
 
-Each run starts from the latest version, so pass only what changes in that run (the new app, a new setting).
-The password is checked against Azure's complexity rules before anything is created. Run the script from a
-regular PowerShell window, Windows Terminal or VS Code: PowerShell ISE turns informational Azure CLI messages
-into errors and stops it.
+1. Finds the latest version in the definition (or `-FromVersion`).
+2. Creates a temporary build VM from it: Trusted Launch, no public IP, not domain joined.
+3. Installs each application listed in `-Apps`, from its manifest.
+4. Applies optional settings: `-EnableTimeZoneRedirection`, `-FSLogixVhdLocation \\<account>.file.core.windows.net\<share>`.
+5. Waits for Windows servicing to be idle, runs Sysprep and captures `-NewVersion`.
+6. Boots a test VM from the **new** version on Dasv7, checks NVMe, Secure Boot, vTPM, and that every application
+   and setting is really in the image. Deletes the test VM.
 
-Measured in the lab (Windows 11 25H2 multi-session, build VM `Standard_D4as_v4`, test VM `Standard_D4as_v7`):
-26 minutes end to end. 7-Zip installed and validated, time zone redirection set, Sysprep, capture, NVMe /
-Secure Boot / vTPM on Dasv7, and `7zip=True` on the new version.
-FSLogix option, same lab: 27 minutes end to end, settings verified inside a VM built from the new version.
+Each run starts from the latest version, so pass only what changes in that run. When it prints
+`NEW GOLD IMAGE READY`, roll it out with session host update and delete the build VM (the command is printed).
 
-## Cleanup
+### Adding an application
+
+One folder per application under `apps/`, with an `app.json`:
+
+```json
+{
+  "name": "7-Zip",
+  "installer": "7z2409-x64.msi",
+  "downloadUrl": "https://www.7-zip.org/a/7z2409-x64.msi",
+  "install": "msiexec.exe /i \"{installer}\" /qn /norestart",
+  "validate": "C:\\Program Files\\7-Zip\\7z.exe"
+}
+```
+
+- `install`: silent install command; `{installer}` is replaced with the downloaded file path.
+- `validate`: a file that exists only when the install succeeded.
+- Installers come from `downloadUrl`, or from your own storage account with
+  `-StorageAccount <account> -Container <container>` (blob path `<container>/<app>/<installer>`).
+  In storage mode the script creates a read-only, 3-hour user delegation SAS: no account keys, no identity on
+  the VM. You need *Storage Blob Data Reader* on the account, and the build VM needs a network path to it.
+
+Applications that change every few weeks are often better delivered with **AVD App Attach** than baked into the
+image; keep the image for the OS, languages, prerequisites and stable apps.
+
+## 3. Full rebuild with a Custom Image Template (optional)
+
+Starts from the Windows 11 multi-session Marketplace image, installs applications by script, adds display
+languages offline, runs Windows Update and Sysprep, and publishes to the gallery. The template shows up under
+*Azure Virtual Desktop > Custom image templates*.
+
+```powershell
+.\New-AvdImageTemplate.ps1 -SubscriptionId <sub> -ResourceGroup <image-rg> -Location <region> `
+    -GalleryName <gallery> -SubnetId <subnet-id> -StagingResourceGroup <empty-staging-rg> `
+    -ScriptBaseUrl https://raw.githubusercontent.com/renatocamara/avd-image-automation-runbook/main
+# follow a running build
+.\New-AvdImageTemplate.ps1 -ResourceGroup <image-rg> -MonitorOnly
+```
+
+It creates a managed identity with a narrow custom role, a `TrustedLaunchSupported` + `SCSI, NVMe` definition
+(the only security type Image Builder can write to; VMs from it still run with Trusted Launch), and the template.
+Languages: `-Languages de-DE,fr-FR,zh-CN`. Apps: `-Apps 7zip` (same `app.json` format as above).
+
+Before the first build, check the subscription for policies that disable **shared key** or **public network
+access** on storage accounts: they break Image Builder's staging storage. See
+[docs/findings.md](docs/findings.md#azure-policy-and-image-builder-staging-storage).
+
+To validate the customizer scripts on a plain VM in about 30 minutes, without Image Builder:
+`Test-CustomizersOnVm.ps1`.
+
+## Repository layout
+
+```
+Test-TrustedLaunchRecapture.ps1   1. capture an existing gold image into an NVMe-capable definition, test on Dasv7
+Update-GoldImage.ps1              2. new image version: apps + settings + capture + test, one command
+New-AvdImageTemplate.ps1          3. Custom Image Template (Azure VM Image Builder) build
+Test-CustomizersOnVm.ps1          run the template customizers on a plain VM, for quick validation
+customizers/                      scripts that run inside the image (languages, apps, Sysprep cleanup)
+apps/<name>/app.json              one manifest per application
+docs/findings.md                  platform limitations found, fixes and measured times
+```
+
+## Cleanup (lab)
 
 ```powershell
 az group delete -n rg-avd-img-test-lab --yes --no-wait
 ```
 
-## Related
+## Further reading
 
-`avd-image-automation-playbook` is the longer-form version of the same pipeline (docs, design decisions,
-private networking as a later step). This runbook is the short, public, one-script-per-outcome version.
+- [Findings, fixes and measured times](docs/findings.md)
+- [Session host update](https://learn.microsoft.com/azure/virtual-desktop/session-host-update)
+- [Custom image templates](https://learn.microsoft.com/azure/virtual-desktop/custom-image-templates)
+- [Language packs for Windows 11 in AVD](https://learn.microsoft.com/azure/virtual-desktop/windows-11-language-packs)
+- [Image Builder and Trusted Launch](https://learn.microsoft.com/azure/virtual-machines/image-builder-overview#confidential-vm-and-trusted-launch-support)
