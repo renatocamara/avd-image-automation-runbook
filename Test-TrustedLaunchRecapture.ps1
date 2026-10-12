@@ -335,5 +335,5 @@ Write-Host "and the result runs on NVMe-only sizes with Trusted Launch. $(if ($u
 Write-Host "This version can be used for session hosts / session host update, but NOT as a Custom Image Template source."
 Write-Host "Captured version ID:"
 Write-Host "  $verId"
-if ($SkipCleanup) { Write-Host "`nTest VM kept: $testVm. Delete the resource group when done: az group delete -n $ResourceGroup --yes" }
+if ($SkipCleanup) { Write-Host "`nTest VM kept: $testVm. Delete it when done: az vm delete -g $ResourceGroup -n $testVm --yes" }
 else { az vm delete -g $ResourceGroup -n $testVm --yes -o none; Write-Host "`nTest VM deleted. Gallery and image version kept in $ResourceGroup." }
