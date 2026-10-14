@@ -144,6 +144,7 @@ if ($existing) {
 Step "3. Install applications ($mode)"
 if ($Apps.Count -eq 0) { Write-Host "    no applications requested" }
 $sas = ""
+$rebootNeeded = $false
 if ($StorageAccount -and $Apps.Count -gt 0) {
     $expiry = (Get-Date).ToUniversalTime().AddHours(3).ToString("yyyy-MM-ddTHH:mmZ")
     $sas = az storage container generate-sas --account-name $StorageAccount -n $Container --permissions r `
@@ -158,6 +159,7 @@ foreach ($app in $Apps) {
     Write-Host "    $app <- $shown"
     $install = $m.install -replace "'", "''"
     $validate = "$($m.validate)" -replace "'", "''"
+    $version = "$($m.version)" -replace "'", "''"
     $script = @"
 `$ProgressPreference = 'SilentlyContinue'
 `$dir = 'C:\Windows\Temp\apps\$app'; New-Item -ItemType Directory -Path `$dir -Force | Out-Null
@@ -167,12 +169,20 @@ try { Invoke-WebRequest -Uri '$url' -OutFile `$file -UseBasicParsing } catch { "
 `$p = Start-Process -FilePath cmd.exe -ArgumentList "/c `$cmd" -Wait -PassThru -NoNewWindow
 if (`$p.ExitCode -notin 0, 3010) { "APP-FAIL install exit code `$(`$p.ExitCode)"; return }
 if ('$validate' -and -not (Test-Path '$validate')) { "APP-FAIL validation: $validate not found"; return }
+`$found = ''
+if ('$version' -and '$validate') {
+    `$vi = (Get-Item '$validate').VersionInfo
+    `$found = ("`$(`$vi.ProductVersion)|`$(`$vi.FileVersion)" -replace ',', '.' -replace ' ', '')
+    if (-not ((`$found -split '\|') | Where-Object { `$_ -like '$version*' })) { "APP-FAIL version: expected $version, found `$found"; return }
+}
 Remove-Item `$dir -Recurse -Force -ErrorAction SilentlyContinue
-"APP-OK exit code `$(`$p.ExitCode)"
+"APP-OK exit code `$(`$p.ExitCode) version `$found"
 "@
     $out = Invoke-OnVm $VmResourceGroup $VmName $script
     if ($out -notmatch 'APP-OK') { Fail "$app : $($out.Trim())" }
-    Pass "$app installed and validated ($($m.validate))"
+    if ($out -match 'APP-OK exit code 3010') { $rebootNeeded = $true }
+    $what = if ($m.version) { "$($m.validate), version $($m.version)" } else { "$($m.validate)" }
+    Pass "$app installed and validated ($what)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -211,6 +221,41 @@ Set-ItemProperty `$k -Name ReAttachIntervalSeconds -Value 15 -Type DWord
 }
 if (-not $EnableTimeZoneRedirection -and -not $FSLogixVhdLocation) { Write-Host "    none requested" }
 
+# a pending reboot (installer exit code 3010, Windows servicing) is a classic cause of a failed Sysprep: restart the
+# build VM first, at most twice. Same signals as the Microsoft FederalAVD image build (Check-CbsState.ps1); pending
+# file renames are left out on purpose, they are often present and do not block Sysprep.
+$pendingCheck = @'
+$r = @()
+$cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'
+if (Test-Path "$cbs\RebootPending") { $r += 'CBS-RebootPending' }
+if (Test-Path "$cbs\RebootInProgress") { $r += 'CBS-RebootInProgress' }
+if ((Get-ItemProperty "$cbs\SessionsPending" -ErrorAction SilentlyContinue).Exclusive -gt 0) { $r += 'CBS-SessionsPending' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $r += 'WindowsUpdate' }
+'PENDING=' + ($r -join ',')
+'@
+for ($i = 1; $i -le 3; $i++) {
+    $out = Invoke-OnVm $VmResourceGroup $VmName $pendingCheck
+    $pending = if ($out -match 'PENDING=(\S*)') { $Matches[1] } else { '' }
+    if ($rebootNeeded) { $pending = (@($pending, 'exit code 3010') | Where-Object { $_ }) -join ',' }
+    if (-not $pending) { if ($i -eq 1) { Pass "no reboot pending" }; break }
+    if ($i -eq 3) { break }
+    Write-Host "    reboot pending ($pending), restarting $VmName (round $i)"
+    az vm restart -g $VmResourceGroup -n $VmName -o none
+    if ($LASTEXITCODE -ne 0) { Fail "restart of $VmName failed (see error above)" }
+    $rebootNeeded = $false
+    # the VM agent needs a moment after the restart before Run Command works again
+    $ready = $false
+    for ($t = 1; $t -le 10 -and -not $ready; $t++) {
+        Start-Sleep 30
+        $ErrorActionPreference = "Continue"
+        $ready = (Invoke-OnVm $VmResourceGroup $VmName "'READY'") -match 'READY'
+        $ErrorActionPreference = "Stop"
+    }
+    if (-not $ready) { Fail "$VmName did not respond to Run Command after the restart; re-run the same command later (the VM is reused)" }
+    Pass "$VmName restarted"
+}
+if ($pending) { Write-Host "    WARNING: still reports a pending reboot ($pending) after two restarts; continuing" -ForegroundColor Yellow }
+
 # a VM fresh from a generalized image can still be servicing for a few minutes; Sysprep must wait for it
 Write-Host "    waiting for Windows servicing to be idle before Sysprep..."
 $deadline = (Get-Date).AddMinutes(20)
@@ -234,10 +279,18 @@ if ($LASTEXITCODE -ne 0) { Fail "capture / boot test failed (see above)" }
 # ---------------------------------------------------------------------------------------------
 Step "6. Applications on the NEW image (inside the test VM)"
 if ($Apps.Count -gt 0) {
-    $checks = ($Apps | ForEach-Object { "'$_=' + (Test-Path '$($manifests[$_].validate)')" }) -join "`n"
+    $checks = ($Apps | ForEach-Object {
+        $v = "$($manifests[$_].validate)" -replace "'", "''"
+        "if (Test-Path '$v') { `$vi = (Get-Item '$v').VersionInfo; '$_=True|' + (`"`$(`$vi.ProductVersion)|`$(`$vi.FileVersion)`" -replace ',', '.' -replace ' ', '') } else { '$_=False' }"
+    }) -join "`n"
     $out = Invoke-OnVm $ResourceGroup "vm-gold-test" $checks
     $out -split "`n" | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
-    foreach ($app in $Apps) { if ($out -notmatch "$([regex]::Escape($app))=True") { Fail "$app not found on the new image (test VM vm-gold-test kept for inspection)" } }
+    foreach ($app in $Apps) {
+        if ($out -notmatch "(?m)^$([regex]::Escape($app))=True\|(.*)$") { Fail "$app not found on the new image (test VM vm-gold-test kept for inspection)" }
+        $found = $Matches[1].Trim()
+        $want = "$($manifests[$app].version)"
+        if ($want -and -not (($found -split '\|') | Where-Object { $_ -like "$want*" })) { Fail "$app on the new image has version $found, expected $want (test VM vm-gold-test kept for inspection)" }
+    }
 } else { Write-Host "    no applications requested" }
 if ($FSLogixVhdLocation) {
     $out = Invoke-OnVm $ResourceGroup "vm-gold-test" "'FSLOGIX=' + (Get-ItemProperty 'HKLM:\SOFTWARE\FSLogix\Profiles' -ErrorAction SilentlyContinue).Enabled"

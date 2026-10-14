@@ -124,12 +124,18 @@ One folder per application under `apps/`, with an `app.json`:
   "installer": "7z2409-x64.msi",
   "downloadUrl": "https://www.7-zip.org/a/7z2409-x64.msi",
   "install": "msiexec.exe /i \"{installer}\" /qn /norestart",
-  "validate": "C:\\Program Files\\7-Zip\\7z.exe"
+  "validate": "C:\\Program Files\\7-Zip\\7z.exe",
+  "version": "24.09"
 }
 ```
 
 - `install`: silent install command; `{installer}` is replaced with the downloaded file path.
 - `validate`: a file that exists only when the install succeeded.
+- `version` (optional): expected product or file version of the `validate` file, checked as a prefix (`24.09`
+  matches `24.09.0.0`). Use it when updating an application that is already in the image: without it, the check
+  only proves the file exists, which the old version already satisfies.
+- Exit code `3010` (reboot required) counts as success. Before Sysprep the script restarts the build VM when an
+  installer returned 3010 or Windows reports a pending reboot.
 - Installers come from `downloadUrl`, or from your own storage account with
   `-StorageAccount <account> -Container <container>` (blob path `<container>/<app>/<installer>`).
   In storage mode the script creates a read-only, 3-hour user delegation SAS: no account keys, no identity on
