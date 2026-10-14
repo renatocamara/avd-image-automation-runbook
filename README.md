@@ -141,6 +141,11 @@ One folder per application under `apps/`, with an `app.json`:
   In storage mode the script creates a read-only, 3-hour user delegation SAS: no account keys, no identity on
   the VM. You need *Storage Blob Data Reader* on the account, and the build VM needs a network path to it.
 
+To publish a folder of vendor installers in one step, `Publish-AppInstallers.ps1 -SourcePath <folder>
+-StorageAccount <account> -Container <container>` uploads each file to its own folder with a simple name
+(`<app>/setup.exe`, no spaces), reads the version from the file name, and creates a starting `app.json` per
+application; only the silent switch and the `validate` path are left to fill in.
+
 Applications that change every few weeks are often better delivered with **AVD App Attach** than baked into the
 image; keep the image for the OS, languages, prerequisites and stable apps.
 
@@ -174,6 +179,7 @@ To validate the customizer scripts on a plain VM in about 30 minutes, without Im
 ```
 Test-TrustedLaunchRecapture.ps1   1. capture an existing gold image into an NVMe-capable definition, test on Dasv7
 Update-GoldImage.ps1              2. new image version: apps + settings + capture + test, one command
+Publish-AppInstallers.ps1         upload a folder of installers to the container and create starting app.json files
 New-AvdImageTemplate.ps1          3. Custom Image Template (Azure VM Image Builder) build
 Test-CustomizersOnVm.ps1          run the template customizers on a plain VM, for quick validation
 customizers/                      scripts that run inside the image (languages, apps, Sysprep cleanup)
