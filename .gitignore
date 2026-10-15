@@ -5,3 +5,5 @@ customer/
 generated/
 apps/*/*.msi
 apps/*/*.exe
+# App Attach signing certificate saved by New-AppAttachPackage.ps1
+*.cer
