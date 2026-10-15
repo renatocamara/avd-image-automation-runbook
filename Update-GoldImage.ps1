@@ -166,7 +166,8 @@ foreach ($app in $Apps) {
 `$file = Join-Path `$dir '$($m.installer)'
 try { Invoke-WebRequest -Uri '$url' -OutFile `$file -UseBasicParsing } catch { "APP-FAIL download: `$(`$_.Exception.Message)"; return }
 `$cmd = '$install' -replace '\{installer\}', `$file
-`$p = Start-Process -FilePath cmd.exe -ArgumentList "/c `$cmd" -Wait -PassThru -NoNewWindow
+# /s plus outer quotes: cmd keeps every quote inside the install line (without /s, cmd drops the first and last quote)
+`$p = Start-Process -FilePath cmd.exe -ArgumentList "/s /c ```"`$cmd```"" -Wait -PassThru -NoNewWindow
 if (`$p.ExitCode -notin 0, 3010) { "APP-FAIL install exit code `$(`$p.ExitCode)"; return }
 if ('$validate' -and -not (Test-Path '$validate')) { "APP-FAIL validation: $validate not found"; return }
 `$found = ''

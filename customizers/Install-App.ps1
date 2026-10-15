@@ -49,7 +49,8 @@ if ($ManifestUrl) {
 # 3. Run the silent install
 $cmd = $manifest.install -replace '\{installer\}', $installerPath
 Write-Host "Running: $cmd"
-$proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $cmd" -Wait -PassThru -NoNewWindow
+# /s plus outer quotes: cmd keeps every quote inside the install line (without /s, cmd drops the first and last quote)
+$proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/s /c `"$cmd`"" -Wait -PassThru -NoNewWindow
 Write-Host "Exit code: $($proc.ExitCode)"
 if ($proc.ExitCode -notin 0, 3010) { throw "Install of $AppName failed with exit code $($proc.ExitCode)" }
 
