@@ -10,7 +10,9 @@
          For production, replace it with a code signing certificate from your PKI (same subject as -Publisher).
       3. Downloads the installer from the storage account (read-only SAS), installs it silently with the manifest
          command, and copies the installation folder (the folder of "validate") into the package layout.
-      4. Writes AppxManifest.xml, packs and signs the MSIX.
+      4. Writes AppxManifest.xml with the application's own icon (from -IconFile, <program>.ico, any .ico in the
+         folder, or the icon embedded in the program) and a desktop shortcut (unless -NoDesktopShortcut), then packs
+         and signs the MSIX (with an RFC 3161 timestamp when -TimestampUrl is given).
       5. Converts it to CimFS (.cim and its data files) with msixmgr and copies them to the share.
     The public certificate (.cer) is saved locally: the session hosts must trust it (Local Machine > Trusted People),
     in the gold image for production.
@@ -38,6 +40,9 @@ param(
     [Parameter(Mandatory)] [string]$ShareResourceGroup,
     [Parameter(Mandatory)] [string]$ShareStorageAccount,
     [Parameter(Mandatory)] [string]$ShareName,
+    [string]$IconFile = "",                               # .ico relative to the installation folder (default: automatic)
+    [switch]$NoDesktopShortcut,                           # by default the package creates a desktop shortcut
+    [string]$TimestampUrl = "",                           # e.g. http://timestamp.digicert.com (signature stays valid after the certificate expires)
     [string]$SubscriptionId = ""
 )
 $ErrorActionPreference = "Stop"
@@ -78,6 +83,7 @@ $ProgressPreference = 'SilentlyContinue'
 $url = '__URL__'; $installer = '__INSTALLER__'; $install = '__INSTALL__'; $srcDir = '__INSTALLDIR__'; $exe = '__EXE__'
 $name = '__NAME__'; $pub = '__PUB__'; $ver = '__VER__'; $display = '__DISPLAY__'
 $share = '__SHARE__'; $sa = '__SA__'; $key = '__KEY__'
+$iconFile = '__ICON__'; $shortcut = '__SHORTCUT__' -eq '1'; $tsUrl = '__TSURL__'
 $root = 'C:\msix'; $work = "$root\build-$name-$ver"
 function Run($exe, $argList) { $o = & $exe @argList 2>&1; if ($LASTEXITCODE -ne 0) { $o | Select-Object -Last 8; throw "$(Split-Path $exe -Leaf) exit $LASTEXITCODE" } }
 try {
@@ -120,26 +126,53 @@ $fv = (Get-Item (Join-Path $srcDir $exe)).VersionInfo.ProductVersion
 "STEP installed and copied: $srcDir (program version $fv)"
 
 Add-Type -AssemblyName System.Drawing
+$appDir = "$work\layout\App"
+$iconPath = ''
+if ($iconFile) { $iconPath = if ([IO.Path]::IsPathRooted($iconFile)) { $iconFile } else { Join-Path $appDir $iconFile } }
+elseif (Test-Path "$appDir\$exe.ico") { $iconPath = "$appDir\$exe.ico" }
+else { $c = Get-ChildItem $appDir -Filter *.ico | Select-Object -First 1; if ($c) { $iconPath = $c.FullName } }
+if ($iconPath -and (Test-Path $iconPath)) {
+    $ico = New-Object System.Drawing.Icon($iconPath, 256, 256); $src = $ico.ToBitmap(); $iconFrom = Split-Path $iconPath -Leaf
+} else {
+    $src = ([System.Drawing.Icon]::ExtractAssociatedIcon("$appDir\$exe")).ToBitmap(); $iconFrom = "$exe (embedded icon)"; $iconPath = ''
+}
 foreach ($a in @(@('StoreLogo', 50), @('Square150x150Logo', 150), @('Square44x44Logo', 44))) {
     $b = New-Object System.Drawing.Bitmap $a[1], $a[1]
-    $g = [System.Drawing.Graphics]::FromImage($b); $g.Clear([System.Drawing.Color]::SteelBlue); $g.Dispose()
+    $g = [System.Drawing.Graphics]::FromImage($b)
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $g.Clear([System.Drawing.Color]::Transparent); $g.DrawImage($src, 0, 0, $a[1], $a[1]); $g.Dispose()
     $b.Save("$work\layout\Assets\$($a[0]).png", [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
 }
+$src.Dispose()
+"STEP icon from $iconFrom"
 $esc = { param($s) [Security.SecurityElement]::Escape($s) }
+# Desktop shortcut: icon = the .ico inside the package, or the program itself (its embedded icon)
+$scIcon = if ($iconPath -and $iconPath.StartsWith($appDir, [StringComparison]::OrdinalIgnoreCase)) { 'App' + $iconPath.Substring($appDir.Length) } else { "App\$exe" }
+$lnk = ($display -replace '[\\/:*?"<>|]', '') + '.lnk'
+$extensions = if ($shortcut) {
+@"
+      <Extensions>
+        <desktop7:Extension Category="windows.shortcut">
+          <desktop7:Shortcut File="[{Desktop}]\$(& $esc $lnk)" Icon="[{Package}]\$(& $esc $scIcon)" />
+        </desktop7:Extension>
+      </Extensions>
+"@
+} else { '' }
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
-<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" xmlns:desktop7="http://schemas.microsoft.com/appx/manifest/desktop/windows10/7" IgnorableNamespaces="uap rescap desktop7">
   <Identity Name="$name" Publisher="$(& $esc $pub)" Version="$ver" ProcessorArchitecture="x86" />
   <Properties>
     <DisplayName>$(& $esc $display)</DisplayName>
     <PublisherDisplayName>$(& $esc ($pub -replace '^CN=',''))</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
-  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" /></Dependencies>
+  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" /></Dependencies>
   <Resources><Resource Language="en-us" /></Resources>
   <Applications>
     <Application Id="App" Executable="App\$exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements DisplayName="$(& $esc $display)" Description="$(& $esc $display)" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+$extensions
     </Application>
   </Applications>
   <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
@@ -148,8 +181,10 @@ $manifest = @"
 [IO.File]::WriteAllText("$work\layout\AppxManifest.xml", $manifest)
 $msix = "$work\$name`_$ver.msix"
 Run "$root\sdk\makeappx.exe" @('pack', '/d', "$work\layout", '/p', $msix, '/o')
-Run "$root\sdk\signtool.exe" @('sign', '/fd', 'SHA256', '/f', "$root\signing.pfx", '/p', $pfxPw, $msix)
-'STEP packed and signed'
+$signArgs = @('sign', '/fd', 'SHA256', '/f', "$root\signing.pfx", '/p', $pfxPw)
+if ($tsUrl) { $signArgs += @('/tr', $tsUrl, '/td', 'SHA256') }
+Run "$root\sdk\signtool.exe" ($signArgs + $msix)
+"STEP packed and signed$(if ($tsUrl) { ' (timestamped)' })$(if ($shortcut) { ', desktop shortcut ' + $lnk })"
 
 $cimName = "$($name.ToLower())-$ver.cim"
 Run "$root\msixmgr\x64\msixmgr.exe" @('-Unpack', '-packagePath', $msix, '-destination', "$work\cim\$cimName", '-applyACLs', '-create', '-fileType', 'cim', '-rootDirectory', 'apps')
@@ -171,6 +206,7 @@ $values = [ordered]@{
     '__URL__' = $url; '__INSTALLER__' = "$($m.installer)"; '__INSTALL__' = "$($m.install)"; '__INSTALLDIR__' = $InstallDir
     '__EXE__' = $exe; '__NAME__' = $PackageName; '__PUB__' = $Publisher; '__VER__' = $Version; '__DISPLAY__' = $DisplayName
     '__SHARE__' = $share; '__SA__' = $ShareStorageAccount; '__KEY__' = $key
+    '__ICON__' = $IconFile; '__SHORTCUT__' = $(if ($NoDesktopShortcut) { '0' } else { '1' }); '__TSURL__' = $TimestampUrl
 }
 foreach ($k in $values.Keys) { $remote = $remote.Replace($k, ($values[$k] -replace "'", "''")) }
 
